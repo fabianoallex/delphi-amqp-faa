@@ -1,0 +1,34 @@
+# Delphi compiled output
+*.dcu
+*.dcp
+*.dcpil
+*.bpl
+*.exe
+*.dll
+*.map
+*.drc
+*.res
+!*.dproj.local
+
+# Delphi IDE files
+*.identcache
+*.tvsconfig
+*.dproj.local
+*.local
+*.stat
+__history/
+__recovery/
+*.~*
+
+# Output directories
+Win32/
+Win64/
+Android/
+Android64/
+iOSDevice64/
+Linux64/
+OSX64/
+OSXARM64/
+
+# DCU output (se usar subdir)
+dcu/
