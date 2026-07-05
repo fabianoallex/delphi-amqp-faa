@@ -1,0 +1,68 @@
+﻿unit AMQP.Protocol;
+
+{ Constantes do protocolo AMQP 0-9-1.
+
+  Fonte: especificacao publica AMQP 0-9-1 (documento de protocolo). Nada aqui
+  deriva de codigo de terceiros — sao apenas os valores numericos definidos pela
+  especificacao (tipos de frame, octeto de fim de frame, IDs de classe/metodo).
+
+  Todos os inteiros multi-byte no protocolo trafegam em big-endian (network
+  byte order). Ver AMQP.Wire para o encode/decode. }
+
+interface
+
+const
+  /// Cabecalho de protocolo enviado pelo cliente logo apos abrir o socket:
+  /// os 4 octetos ASCII "AMQP" seguidos de major=0, minor=9, revision=1.
+  /// (o 5o octeto e' o protocol-id, 0 para AMQP; depois vem 0,9,1).
+  AMQP_PROTOCOL_HEADER: array[0..7] of Byte =
+    (Ord('A'), Ord('M'), Ord('Q'), Ord('P'), 0, 0, 9, 1);
+
+  // --- Tipos de frame (octeto 0 do frame) ---------------------------------
+  AMQP_FRAME_METHOD    = 1;
+  AMQP_FRAME_HEADER    = 2;
+  AMQP_FRAME_BODY      = 3;
+  AMQP_FRAME_HEARTBEAT = 8;
+
+  /// Octeto que encerra todo frame (0xCE). Se o byte lido nesta posicao for
+  /// diferente disto, o stream esta dessincronizado / corrompido.
+  AMQP_FRAME_END = $CE;
+
+  /// Tamanho minimo de frame que todo peer deve aceitar (spec 4.2.5).
+  /// Usado como piso ao negociar frame-max no handshake.
+  AMQP_FRAME_MIN_SIZE = 4096;
+
+  /// Canal 0 e' reservado para metodos de nivel de conexao (Connection.*).
+  AMQP_CHANNEL_CONNECTION = 0;
+
+  // --- IDs de classe ------------------------------------------------------
+  AMQP_CLASS_CONNECTION = 10;
+  AMQP_CLASS_CHANNEL    = 20;
+  AMQP_CLASS_EXCHANGE   = 40;
+  AMQP_CLASS_QUEUE      = 50;
+  AMQP_CLASS_BASIC      = 60;
+  AMQP_CLASS_TX         = 90;
+
+  // --- Metodos de Connection (classe 10) ----------------------------------
+  AMQP_CONNECTION_START    = 10;
+  AMQP_CONNECTION_START_OK  = 11;
+  AMQP_CONNECTION_SECURE   = 20;
+  AMQP_CONNECTION_SECURE_OK = 21;
+  AMQP_CONNECTION_TUNE     = 30;
+  AMQP_CONNECTION_TUNE_OK   = 31;
+  AMQP_CONNECTION_OPEN     = 40;
+  AMQP_CONNECTION_OPEN_OK   = 41;
+  AMQP_CONNECTION_CLOSE    = 50;
+  AMQP_CONNECTION_CLOSE_OK  = 51;
+
+  // --- Metodos de Channel (classe 20) -------------------------------------
+  AMQP_CHANNEL_OPEN     = 10;
+  AMQP_CHANNEL_OPEN_OK   = 11;
+  AMQP_CHANNEL_FLOW     = 20;
+  AMQP_CHANNEL_FLOW_OK   = 21;
+  AMQP_CHANNEL_CLOSE    = 40;
+  AMQP_CHANNEL_CLOSE_OK  = 41;
+
+implementation
+
+end.
