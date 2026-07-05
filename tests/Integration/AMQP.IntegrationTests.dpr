@@ -20,7 +20,8 @@ uses
   AMQP.Connection in '..\..\src\AMQP.Connection.pas',
   AMQP.HandshakeIntegrationTests in 'AMQP.HandshakeIntegrationTests.pas',
   AMQP.ChannelIntegrationTests in 'AMQP.ChannelIntegrationTests.pas',
-  AMQP.ConsumeIntegrationTests in 'AMQP.ConsumeIntegrationTests.pas';
+  AMQP.ConsumeIntegrationTests in 'AMQP.ConsumeIntegrationTests.pas',
+  AMQP.ReconnectIntegrationTests in 'AMQP.ReconnectIntegrationTests.pas';
 
 var
   runner: ITestRunner;

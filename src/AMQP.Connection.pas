@@ -69,6 +69,11 @@ type
     ChannelMax: Word;
     FrameMax: Cardinal;
     Heartbeat: Word;
+    // Reconexão automática (opt-in).
+    AutoReconnect: Boolean;
+    ReconnectDelayMs: Cardinal;    // espera entre tentativas (padrão 2000)
+    MaxReconnectAttempts: Integer; // 0 = infinitas
+    ConnectionName: string;        // opcional; vai em client-properties
     /// Parâmetros padrão: localhost:5672, vhost '/', guest/guest.
     class function Localhost: TAMQPConnectionParams; static;
   end;
@@ -90,6 +95,10 @@ type
   TAMQPConnection = class;
   TAMQPChannel = class;
 
+  { Callback de eventos de conexão (desconexão / reconexão). Roda numa thread
+    interna; mantenha-o curto e não bloqueante. }
+  TAMQPConnectionEvent = reference to procedure(AConnection: TAMQPConnection);
+
   { Mensagem entregue a um consumer (Basic.Deliver). Se Properties tiver
     Headers, a tabela é liberada automaticamente após o callback retornar. }
   TAMQPDelivery = record
@@ -107,6 +116,17 @@ type
     thread de leitura. Use AChannel.Ack(ADelivery.DeliveryTag) para confirmar. }
   TAMQPConsumerCallback = reference to procedure(AChannel: TAMQPChannel;
     const ADelivery: TAMQPDelivery);
+
+  { Ação de topologia gravada para replay após reconexão. Guardamos o payload
+    já serializado do método (qos/declare/bind/consume) — assim argumentos e
+    flags vêm de graça. Consumers guardam também o tag e o callback. }
+  TAMQPRecoveryAction = record
+    Payload: TBytes;
+    AwaitReply: Boolean;    // True: espera o -Ok (CallRpc); False: só envia
+    IsConsume: Boolean;
+    ConsumerTag: string;
+    Callback: TAMQPConsumerCallback;
+  end;
 
   TAMQPRpcKind = (rkNone, rkMethod, rkMessage, rkError);
 
@@ -138,6 +158,16 @@ type
     FConsumersLock: TCriticalSection;
     FConsumerCounter: Integer;
     FInFlight: Integer; // callbacks em execução no pool (atômico)
+    // --- topologia gravada para reconexão ---
+    FRecovery: TList<TAMQPRecoveryAction>;
+    FRecoveryLock: TCriticalSection;
+    procedure AddRecovery(const APayload: TBytes; AAwaitReply: Boolean;
+      AIsConsume: Boolean = False; const AConsumerTag: string = '';
+      const ACallback: TAMQPConsumerCallback = nil);
+    /// Remove a gravação de recovery de um consumer (ao cancelá-lo).
+    procedure RemoveConsumerRecovery(const AConsumerTag: string);
+    /// Reabre o canal e replaya a topologia gravada (chamado na reconexão).
+    procedure Recover;
     procedure Open;
     /// Envia um método e aguarda a resposta (payload do método de resposta).
     function CallRpc(const ARequest: TBytes): TBytes;
@@ -230,6 +260,12 @@ type
     FHbStopEvent: TEvent;
     FLastWriteTick: UInt64; // atualizado a cada frame enviado
     FLastReadTick: UInt64;  // atualizado a cada frame recebido
+    // --- reconexão ---
+    FDeliberateClose: Boolean; // True quando o usuário fechou (não reconectar)
+    FReconnecting: Boolean;
+    FOnDisconnect: TAMQPConnectionEvent;
+    FOnReconnect: TAMQPConnectionEvent;
+    FOnReconnectFailed: TAMQPConnectionEvent;
     // --- envio (serializado por FWriteLock) ---
     procedure SendFrameNoLock(AFrameType: Byte; AChannel: Word; const APayload: TBytes);
     procedure SendFrame(AFrameType: Byte; AChannel: Word; const APayload: TBytes);
@@ -238,7 +274,10 @@ type
     function NextFrame: TAMQPFrame;
     function NextMethodOn(AExpectChannel: Word; out AId: TAMQPMethodId): TAMQPReader;
     function ExpectMethod(AExpectChannel, AClassId, AMethodId: Word): TAMQPReader;
+    function BuildClientProperties: TAMQPFieldTable;
     procedure Handshake;
+    procedure EstablishConnection;
+    procedure CloseSocketStream;
     // --- threads ---
     procedure StartReadThread;
     procedure StopReadThread;
@@ -249,6 +288,11 @@ type
     procedure HandleConnectionFrame(const AFrame: TAMQPFrame);
     procedure ReadThreadFinished(const AError: string);
     procedure UnregisterChannel(AChannelId: Word);
+    // --- reconexão ---
+    procedure RunReconnect;
+    procedure RecoverAllChannels;
+    procedure DrainAllChannels;
+    procedure WaitReconnectStopped;
   public
     constructor Create(const AParams: TAMQPConnectionParams);
     destructor Destroy; override;
@@ -259,9 +303,17 @@ type
     function CreateChannel: TAMQPChannel;
     /// Envia Connection.Close, aguarda Close-Ok e fecha o socket.
     procedure Close(AReplyCode: Word = 200; const AReplyText: string = 'Goodbye');
+    /// Fecha o socket abruptamente para simular queda de rede (uso em testes).
+    procedure DropConnectionForTest;
 
     property IsOpen: Boolean read FIsOpen;
     property NegotiatedTune: TAMQPConnectionTune read FNegotiated;
+    /// Disparado (em thread interna) quando a conexão cai e a reconexão inicia.
+    property OnDisconnect: TAMQPConnectionEvent read FOnDisconnect write FOnDisconnect;
+    /// Disparado após reconectar e restaurar a topologia com sucesso.
+    property OnReconnect: TAMQPConnectionEvent read FOnReconnect write FOnReconnect;
+    /// Disparado quando a reconexão esgota as tentativas.
+    property OnReconnectFailed: TAMQPConnectionEvent read FOnReconnectFailed write FOnReconnectFailed;
   end;
 
 implementation
@@ -323,6 +375,10 @@ begin
   Result.ChannelMax := 2047;
   Result.FrameMax := 131072;
   Result.Heartbeat := 60;
+  Result.AutoReconnect := False;
+  Result.ReconnectDelayMs := 2000;
+  Result.MaxReconnectAttempts := 0; // infinitas
+  Result.ConnectionName := '';
 end;
 
 { TAMQPReaderThread }
@@ -398,21 +454,10 @@ destructor TAMQPConnection.Destroy;
 var
   LChan: TAMQPChannel;
 begin
-  if FIsOpen then
-    try
-      Close;
-    except
-    end;
-  StopHeartbeatThread;
-  StopReadThread;
-  FStream.Free;
-  if Assigned(FSocket) then
-  begin
-    try
-      FSocket.Close;
-    except
-    end;
-    FSocket.Free;
+  // Close é idempotente: aborta reconexão, para threads e fecha o socket.
+  try
+    Close;
+  except
   end;
   // Libera canais que o usuário não liberou (cada Free chama UnregisterChannel,
   // que remove do dicionário; por isso iteramos sobre uma cópia).
@@ -435,6 +480,8 @@ var
   LFrame: TAMQPFrame;
 begin
   // Assume FWriteLock já adquirido (envio de grupo de frames, ex.: Publish).
+  if not Assigned(FStream) then
+    raise EAMQPConnection.Create('conexão indisponível no momento (reconectando?)');
   LFrame := TAMQPFrame.Create(AFrameType, AChannel, APayload);
   LFrame.WriteTo(FStream);
   FLastWriteTick := TThread.GetTickCount64;
@@ -533,7 +580,7 @@ begin
         'servidor não oferece o mecanismo %s (oferece: %s)',
         [AMQP_AUTH_PLAIN, LStart.Mechanisms]);
 
-    LProps := DefaultClientProperties;
+    LProps := BuildClientProperties;
     try
       SendMethod(AMQP_CHANNEL_CONNECTION, BuildStartOk(LProps, AMQP_AUTH_PLAIN,
         PlainAuthResponse(FParams.User, FParams.Password), AMQP_LOCALE_DEFAULT));
@@ -564,21 +611,55 @@ begin
   end;
 end;
 
-procedure TAMQPConnection.Open;
+function TAMQPConnection.BuildClientProperties: TAMQPFieldTable;
 begin
-  if FIsOpen then
-    raise EAMQPConnection.Create('conexão já está aberta');
+  Result := DefaultClientProperties;
+  if FParams.ConnectionName <> '' then
+    Result.Put('connection_name', FParams.ConnectionName);
+end;
 
+procedure TAMQPConnection.EstablishConnection;
+begin
+  // Cria socket, faz o handshake (síncrono, inline) e sobe as threads.
+  // Usado tanto no Open inicial quanto na reconexão.
   FSocket := TSocket.Create(TSocketType.TCP);
   FSocket.Connect(FParams.Host, '', '', FParams.Port);
   FStream := TAMQPSocketStream.Create(FSocket);
 
-  Handshake;           // síncrono, antes da thread
-  FIsOpen := True;
+  Handshake; // antes de qualquer thread
+
   FLastWriteTick := TThread.GetTickCount64;
   FLastReadTick := FLastWriteTick;
   StartReadThread;     // a partir daqui, só a thread lê o socket
   StartHeartbeatThread;
+  FIsOpen := True;
+end;
+
+procedure TAMQPConnection.CloseSocketStream;
+begin
+  if Assigned(FSocket) then
+    try
+      FSocket.Close;
+    except
+    end;
+  FreeAndNil(FStream);
+  FreeAndNil(FSocket);
+end;
+
+procedure TAMQPConnection.Open;
+begin
+  if FIsOpen then
+    raise EAMQPConnection.Create('conexão já está aberta');
+  EstablishConnection;
+end;
+
+procedure TAMQPConnection.DropConnectionForTest;
+begin
+  if Assigned(FSocket) then
+    try
+      FSocket.Close; // a thread de leitura vai perceber e disparar a reconexão
+    except
+    end;
 end;
 
 { --- Thread de leitura --- }
@@ -676,6 +757,114 @@ begin
   end;
   for LChan in LChannels do
     LChan.SignalError(LMsg);
+
+  // Queda inesperada: dispara a reconexão (numa thread própria, pois esta é a
+  // thread de leitura que está terminando).
+  if FParams.AutoReconnect and (not FDeliberateClose) and (not FReconnecting) then
+  begin
+    FReconnecting := True;
+    TThread.CreateAnonymousThread(
+      procedure
+      begin
+        RunReconnect;
+      end).Start;
+  end;
+end;
+
+procedure TAMQPConnection.DrainAllChannels;
+var
+  LChannels: TArray<TAMQPChannel>;
+  LChan: TAMQPChannel;
+begin
+  FChannelsLock.Enter;
+  try
+    LChannels := FChannels.Values.ToArray;
+  finally
+    FChannelsLock.Leave;
+  end;
+  for LChan in LChannels do
+    LChan.DrainInFlight;
+end;
+
+procedure TAMQPConnection.RecoverAllChannels;
+var
+  LChannels: TArray<TAMQPChannel>;
+  LChan: TAMQPChannel;
+begin
+  FChannelsLock.Enter;
+  try
+    LChannels := FChannels.Values.ToArray;
+  finally
+    FChannelsLock.Leave;
+  end;
+  for LChan in LChannels do
+    LChan.Recover;
+end;
+
+procedure TAMQPConnection.WaitReconnectStopped;
+var
+  LWaited: Integer;
+begin
+  // Assume FDeliberateClose já True. Espera a thread de reconexão encerrar para
+  // evitar corrida no teardown do socket/threads.
+  LWaited := 0;
+  while FReconnecting and (LWaited < 12000) do
+  begin
+    TThread.Sleep(20);
+    Inc(LWaited, 20);
+  end;
+end;
+
+procedure TAMQPConnection.RunReconnect;
+var
+  LAttempt: Integer;
+  LDelay: Cardinal;
+begin
+  // Roda numa thread anônima dedicada; FReconnecting já está True.
+  try
+    StopHeartbeatThread;
+    StopReadThread;    // aguarda a thread de leitura antiga terminar
+    DrainAllChannels;  // callbacks antigos terminam (acks falham no socket morto)
+    CloseSocketStream;
+
+    if Assigned(FOnDisconnect) then
+      try FOnDisconnect(Self); except end;
+
+    LDelay := FParams.ReconnectDelayMs;
+    if LDelay = 0 then
+      LDelay := 2000;
+
+    LAttempt := 0;
+    while not FDeliberateClose do
+    begin
+      TThread.Sleep(LDelay);
+      if FDeliberateClose then
+        Break;
+      Inc(LAttempt);
+      try
+        EstablishConnection; // novo socket + handshake + threads (FIsOpen := True)
+        RecoverAllChannels;  // reabre canais e replaya a topologia gravada
+        if Assigned(FOnReconnect) then
+          try FOnReconnect(Self); except end;
+        Exit; // sucesso
+      except
+        // tentativa falhou: limpa o estado parcial e tenta de novo
+        FIsOpen := False;
+        StopHeartbeatThread;
+        StopReadThread;
+        CloseSocketStream;
+        if (FParams.MaxReconnectAttempts > 0) and
+           (LAttempt >= FParams.MaxReconnectAttempts) then
+        begin
+          if Assigned(FOnReconnectFailed) then
+            try FOnReconnectFailed(Self); except end;
+          Break;
+        end;
+      end;
+    end;
+  finally
+    FReconnecting := False;
+  end;
 end;
 
 procedure TAMQPConnection.DispatchFrame(const AFrame: TAMQPFrame);
@@ -768,24 +957,30 @@ procedure TAMQPConnection.Close(AReplyCode: Word; const AReplyText: string);
 var
   LClose: TAMQPConnectionClose;
 begin
-  if not FIsOpen then
-    Exit;
-  FIsOpen := False;
+  // Idempotente. Sinaliza fechamento deliberado e aguarda qualquer reconexão em
+  // curso encerrar antes de mexer no socket/threads (evita corrida).
+  FDeliberateClose := True;
+  WaitReconnectStopped;
 
-  StopHeartbeatThread; // não enviar heartbeats durante o fechamento
-
-  LClose.ReplyCode := AReplyCode;
-  LClose.ReplyText := AReplyText;
-  LClose.ClassId := 0;
-  LClose.MethodId := 0;
-  try
-    FCloseOkEvent.ResetEvent;
-    SendMethod(AMQP_CHANNEL_CONNECTION, BuildClose(LClose));
-    FCloseOkEvent.WaitFor(3000);
-  except
+  if FIsOpen then
+  begin
+    FIsOpen := False;
+    StopHeartbeatThread; // não enviar heartbeats durante o fechamento
+    LClose.ReplyCode := AReplyCode;
+    LClose.ReplyText := AReplyText;
+    LClose.ClassId := 0;
+    LClose.MethodId := 0;
+    try
+      FCloseOkEvent.ResetEvent;
+      SendMethod(AMQP_CHANNEL_CONNECTION, BuildClose(LClose));
+      FCloseOkEvent.WaitFor(3000);
+    except
+    end;
   end;
 
+  StopHeartbeatThread;
   StopReadThread; // termina a thread e fecha o socket
+  CloseSocketStream;
 end;
 
 { TAMQPChannel }
@@ -799,6 +994,8 @@ begin
   FRpcEvent := TEvent.Create(nil, True, False, '');
   FConsumers := TDictionary<string, TAMQPConsumerCallback>.Create;
   FConsumersLock := TCriticalSection.Create;
+  FRecovery := TList<TAMQPRecoveryAction>.Create;
+  FRecoveryLock := TCriticalSection.Create;
   FAsmState := asIdle;
 end;
 
@@ -810,11 +1007,95 @@ begin
     except
     end;
   DrainInFlight; // garante que nenhum callback ainda usa este canal
+  FRecovery.Free;
+  FRecoveryLock.Free;
   FConsumers.Free;
   FConsumersLock.Free;
   FRpcEvent.Free;
   FRpcLock.Free;
   inherited;
+end;
+
+procedure TAMQPChannel.AddRecovery(const APayload: TBytes; AAwaitReply: Boolean;
+  AIsConsume: Boolean; const AConsumerTag: string;
+  const ACallback: TAMQPConsumerCallback);
+var
+  LAction: TAMQPRecoveryAction;
+begin
+  LAction.Payload := APayload;
+  LAction.AwaitReply := AAwaitReply;
+  LAction.IsConsume := AIsConsume;
+  LAction.ConsumerTag := AConsumerTag;
+  LAction.Callback := ACallback;
+  FRecoveryLock.Enter;
+  try
+    FRecovery.Add(LAction);
+  finally
+    FRecoveryLock.Leave;
+  end;
+end;
+
+procedure TAMQPChannel.RemoveConsumerRecovery(const AConsumerTag: string);
+var
+  I: Integer;
+begin
+  FRecoveryLock.Enter;
+  try
+    for I := FRecovery.Count - 1 downto 0 do
+      if FRecovery[I].IsConsume and (FRecovery[I].ConsumerTag = AConsumerTag) then
+        FRecovery.Delete(I);
+  finally
+    FRecoveryLock.Leave;
+  end;
+end;
+
+procedure TAMQPChannel.Recover;
+var
+  LActions: TArray<TAMQPRecoveryAction>;
+  LAction: TAMQPRecoveryAction;
+begin
+  // Roda na thread de reconexão. Segura FRpcLock durante todo o replay para que
+  // RPCs do usuário no canal esperem a recuperação terminar. FRpcLock é
+  // recursivo (critical section), então CallRpc interno funciona.
+  FRpcLock.Enter;
+  try
+    FClosed := False;
+    FAsmState := asIdle;
+    Open; // Channel.Open no novo socket (define FIsOpen := True)
+
+    FConsumersLock.Enter;
+    try
+      FConsumers.Clear; // registros da sessão antiga; serão re-adicionados
+    finally
+      FConsumersLock.Leave;
+    end;
+
+    FRecoveryLock.Enter;
+    try
+      LActions := FRecovery.ToArray;
+    finally
+      FRecoveryLock.Leave;
+    end;
+
+    for LAction in LActions do
+    begin
+      if LAction.IsConsume then
+      begin
+        FConsumersLock.Enter;
+        try
+          FConsumers.AddOrSetValue(LAction.ConsumerTag, LAction.Callback);
+        finally
+          FConsumersLock.Leave;
+        end;
+      end;
+      if LAction.AwaitReply then
+        CallRpc(LAction.Payload)
+      else
+        FConnection.SendMethod(FChannelId, LAction.Payload);
+    end;
+  finally
+    FRpcLock.Leave;
+  end;
 end;
 
 function TAMQPChannel.CallRpc(const ARequest: TBytes): TBytes;
@@ -882,13 +1163,15 @@ begin
 end;
 
 procedure TAMQPChannel.DeclareExchange(const ADeclare: TAMQPExchangeDeclare);
+var
+  LPayload: TBytes;
 begin
+  LPayload := BuildExchangeDeclare(ADeclare);
   if ADeclare.NoWait then
-  begin
-    FConnection.SendMethod(FChannelId, BuildExchangeDeclare(ADeclare));
-    Exit;
-  end;
-  CallRpc(BuildExchangeDeclare(ADeclare)); // Declare-Ok (sem args, descartado)
+    FConnection.SendMethod(FChannelId, LPayload)
+  else
+    CallRpc(LPayload); // Declare-Ok (sem args, descartado)
+  AddRecovery(LPayload, not ADeclare.NoWait);
 end;
 
 function TAMQPChannel.DeclareQueue(const ADeclare: TAMQPQueueDeclare): TAMQPQueueDeclareOk;
@@ -896,31 +1179,36 @@ var
   LPayload: TBytes;
   LReader: TAMQPReader;
 begin
+  LPayload := BuildQueueDeclare(ADeclare);
   if ADeclare.NoWait then
   begin
-    FConnection.SendMethod(FChannelId, BuildQueueDeclare(ADeclare));
+    FConnection.SendMethod(FChannelId, LPayload);
     Result := Default(TAMQPQueueDeclareOk);
     Result.QueueName := ADeclare.QueueName;
-    Exit;
+  end
+  else
+  begin
+    LReader := TAMQPReader.Create(CallRpc(LPayload));
+    try
+      ReadMethodHeader(LReader);
+      Result := DecodeQueueDeclareOk(LReader);
+    finally
+      LReader.Free;
+    end;
   end;
-  LPayload := CallRpc(BuildQueueDeclare(ADeclare));
-  LReader := TAMQPReader.Create(LPayload);
-  try
-    ReadMethodHeader(LReader);
-    Result := DecodeQueueDeclareOk(LReader);
-  finally
-    LReader.Free;
-  end;
+  AddRecovery(LPayload, not ADeclare.NoWait);
 end;
 
 procedure TAMQPChannel.BindQueue(const ABind: TAMQPQueueBind);
+var
+  LPayload: TBytes;
 begin
+  LPayload := BuildQueueBind(ABind);
   if ABind.NoWait then
-  begin
-    FConnection.SendMethod(FChannelId, BuildQueueBind(ABind));
-    Exit;
-  end;
-  CallRpc(BuildQueueBind(ABind)); // Bind-Ok (sem args, descartado)
+    FConnection.SendMethod(FChannelId, LPayload)
+  else
+    CallRpc(LPayload); // Bind-Ok (sem args, descartado)
+  AddRecovery(LPayload, not ABind.NoWait);
 end;
 
 procedure TAMQPChannel.Publish(const AExchange, ARoutingKey: string;
@@ -1013,8 +1301,12 @@ begin
 end;
 
 procedure TAMQPChannel.Qos(APrefetchCount: Word; AGlobal: Boolean);
+var
+  LPayload: TBytes;
 begin
-  CallRpc(BuildBasicQos(APrefetchCount, AGlobal)); // Qos-Ok (sem args)
+  LPayload := BuildBasicQos(APrefetchCount, AGlobal);
+  CallRpc(LPayload); // Qos-Ok (sem args)
+  AddRecovery(LPayload, True);
 end;
 
 function TAMQPChannel.Consume(const AQueue: string;
@@ -1022,6 +1314,7 @@ function TAMQPChannel.Consume(const AQueue: string;
 var
   LTag: string;
   LConsume: TAMQPBasicConsume;
+  LPayload: TBytes;
 begin
   // Geramos o consumer-tag no cliente e registramos o callback ANTES de enviar,
   // para não perder deliveries que cheguem entre o Consume-Ok e o registro.
@@ -1033,10 +1326,11 @@ begin
     FConsumersLock.Leave;
   end;
 
+  LConsume := TAMQPBasicConsume.Create(AQueue, LTag, ANoAck);
+  LConsume.Exclusive := AExclusive;
+  LPayload := BuildBasicConsume(LConsume);
   try
-    LConsume := TAMQPBasicConsume.Create(AQueue, LTag, ANoAck);
-    LConsume.Exclusive := AExclusive;
-    CallRpc(BuildBasicConsume(LConsume)); // Consume-Ok (devolve o mesmo tag)
+    CallRpc(LPayload); // Consume-Ok (devolve o mesmo tag)
   except
     FConsumersLock.Enter;
     try
@@ -1046,6 +1340,8 @@ begin
     end;
     raise;
   end;
+  // Grava para replay após reconexão (mesmo tag e callback).
+  AddRecovery(LPayload, True, True, LTag, ACallback);
   Result := LTag;
 end;
 
@@ -1058,6 +1354,7 @@ begin
   finally
     FConsumersLock.Leave;
   end;
+  RemoveConsumerRecovery(AConsumerTag);
 end;
 
 procedure TAMQPChannel.DispatchDelivery(const ADeliver: TAMQPBasicDeliver;
@@ -1249,6 +1546,7 @@ begin
       finally
         FConsumersLock.Leave;
       end;
+      RemoveConsumerRecovery(LTag);
     end
     else if LId.Matches(AMQP_CLASS_CHANNEL, AMQP_CHANNEL_CLOSE) then
     begin
