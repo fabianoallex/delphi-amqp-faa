@@ -1,26 +1,38 @@
 ﻿unit AMQP.Connection;
 
-{ Conexão AMQP 0-9-1 sobre socket TCP e canais (item 2 do roadmap).
+{ Conexão AMQP 0-9-1 sobre socket TCP, com thread de leitura dedicada.
 
-  TAMQPConnection: abre o socket, faz o handshake (protocol-header, Start/
-  Start-Ok, Tune/Tune-Ok, Open/Open-Ok) e cria canais.
+  Arquitetura de concorrência (item 3 do roadmap):
+  - O handshake (Open) é feito de forma síncrona, lendo o socket inline, ANTES
+    de qualquer thread existir.
+  - Depois do Open-Ok, uma única thread de leitura (TAMQPReaderThread) passa a
+    ser a ÚNICA que lê o socket. Ela só faz: ler frame -> demultiplexar por canal
+    -> entregar. Nunca roda código do usuário nem bloqueia.
+  - TODAS as escritas no socket passam por FWriteLock (uma TCriticalSection), de
+    modo que RPCs, publishes, acks e as respostas da própria thread de leitura
+    (Close-Ok) não se embaralham.
+  - RPC (declare/bind/get/close/...) é feito por evento: o chamador registra o
+    que espera, envia o método e aguarda um TEvent que a thread de leitura sinaliza
+    ao entregar a resposta.
 
-  TAMQPChannel: sobre um canal (nº > 0) declara exchange/queue, faz bind, publica
-  (Basic.Publish + content header + body frames) e busca mensagens (Basic.Get +
-  Ack/Nack).
+  Invariantes (para não introduzir corrida/deadlock):
+  - Só a thread de leitura lê o socket depois do handshake.
+  - Ordem de locks sempre "de fora pra dentro": FChannelsLock -> FWriteLock e
+    FRpcLock -> FWriteLock. FWriteLock é sempre o mais interno (nunca se adquire
+    outro lock segurando ele).
+  - A thread de leitura escreve o slot de RPC e chama SetEvent; o chamador só lê
+    o slot depois de WaitFor retornar (o evento é a barreira de sincronização).
 
-  Modelo de concorrência: por ora tudo é síncrono (request/response na thread do
-  chamador). A thread de leitura dedicada com demultiplexação por canal e
-  despacho de consumers vem nos itens 3/4.
-
-  Usa System.Net.Socket.TSocket (RTL pura, sem VCL). Heartbeat (item 4) ainda
-  não existe; use por período curto ou proponha Heartbeat=0 nos parâmetros. }
+  Consumo (Basic.Consume + despacho para thread pool) e heartbeat vêm nos
+  próximos incrementos. }
 
 interface
 
 uses
   System.SysUtils,
   System.Classes,
+  System.SyncObjs,
+  System.Generics.Collections,
   System.Net.Socket,
   AMQP.Protocol,
   AMQP.Wire,
@@ -77,6 +89,8 @@ type
 
   TAMQPConnection = class;
 
+  TAMQPRpcKind = (rkNone, rkMethod, rkMessage, rkError);
+
   { Canal de dados. Criado via TAMQPConnection.CreateChannel (que já o abre).
     O chamador é dono do canal e deve liberá-lo (Free). }
   TAMQPChannel = class
@@ -84,7 +98,31 @@ type
     FConnection: TAMQPConnection;
     FChannelId: Word;
     FIsOpen: Boolean;
+    FClosed: Boolean;
+    // --- RPC (uma chamada por vez neste canal) ---
+    FRpcLock: TCriticalSection;
+    FRpcEvent: TEvent;
+    FRpcKind: TAMQPRpcKind;
+    FRpcMethodPayload: TBytes;
+    FRpcMessage: TAMQPGetResult;
+    FRpcError: string;
+    // --- montagem de conteúdo (escrita só pela thread de leitura) ---
+    FAsmState: (asIdle, asHeader, asBody);
+    FAsmMethodId: TAMQPMethodId;
+    FAsmGetOk: TAMQPBasicGetOk;
+    FAsmProps: TAMQPBasicProperties;
+    FAsmBody: TBytes;
+    FAsmRemaining: UInt64;
     procedure Open;
+    /// Envia um método e aguarda a resposta (payload do método de resposta).
+    function CallRpc(const ARequest: TBytes): TBytes;
+    // sinalizadores chamados pela thread de leitura:
+    procedure SignalMethod(const APayload: TBytes);
+    procedure SignalMessage(const AMessage: TAMQPGetResult);
+    procedure SignalError(const AMessage: string);
+    procedure CompleteContent;
+    /// Trata um frame entregue pela thread de leitura (roda NA thread de leitura).
+    procedure HandleFrame(const AFrame: TAMQPFrame);
   public
     constructor Create(AConnection: TAMQPConnection; AChannelId: Word);
     destructor Destroy; override;
@@ -112,6 +150,15 @@ type
     property IsOpen: Boolean read FIsOpen;
   end;
 
+  TAMQPReaderThread = class(TThread)
+  private
+    FConnection: TAMQPConnection;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(AConnection: TAMQPConnection);
+  end;
+
   TAMQPConnection = class
   private
     FParams: TAMQPConnectionParams;
@@ -120,20 +167,27 @@ type
     FIsOpen: Boolean;
     FNegotiated: TAMQPConnectionTune;
     FNextChannel: Word;
+    FWriteLock: TCriticalSection;
+    FChannelsLock: TCriticalSection;
+    FChannels: TDictionary<Word, TAMQPChannel>;
+    FReadThread: TAMQPReaderThread;
+    FCloseOkEvent: TEvent;
+    // --- envio (serializado por FWriteLock) ---
+    procedure SendFrameNoLock(AFrameType: Byte; AChannel: Word; const APayload: TBytes);
     procedure SendFrame(AFrameType: Byte; AChannel: Word; const APayload: TBytes);
     procedure SendMethod(AChannel: Word; const APayload: TBytes);
-    /// Próximo frame do socket, pulando heartbeats.
+    // --- leitura síncrona, só durante o handshake ---
     function NextFrame: TAMQPFrame;
-    /// Próximo frame de método no canal AExpectChannel; devolve reader após o
-    /// cabeçalho e preenche AId. Trata Connection.Close (levanta EAMQPConnection)
-    /// e Channel.Close (responde Close-Ok e levanta EAMQPChannel). Chamador libera.
     function NextMethodOn(AExpectChannel: Word; out AId: TAMQPMethodId): TAMQPReader;
-    /// Como NextMethodOn, mas exige o método (classe/id) esperado.
     function ExpectMethod(AExpectChannel, AClassId, AMethodId: Word): TAMQPReader;
-    /// Lê content header + body frames de um conteúdo no canal AExpectChannel.
-    function ReadContent(AExpectChannel: Word;
-      out AProps: TAMQPBasicProperties): TBytes;
     procedure Handshake;
+    // --- thread de leitura ---
+    procedure StartReadThread;
+    procedure StopReadThread;
+    procedure DispatchFrame(const AFrame: TAMQPFrame);
+    procedure HandleConnectionFrame(const AFrame: TAMQPFrame);
+    procedure ReadThreadFinished(const AError: string);
+    procedure UnregisterChannel(AChannelId: Word);
   public
     constructor Create(const AParams: TAMQPConnectionParams);
     destructor Destroy; override;
@@ -153,6 +207,9 @@ implementation
 
 uses
   AMQP.Channel.Methods;
+
+const
+  AMQP_RPC_TIMEOUT_MS = 30000; // tempo máximo aguardando resposta de RPC
 
 { TAMQPGetResult }
 
@@ -198,22 +255,55 @@ begin
   Result.Heartbeat := 60;
 end;
 
+{ TAMQPReaderThread }
+
+constructor TAMQPReaderThread.Create(AConnection: TAMQPConnection);
+begin
+  FConnection := AConnection;
+  FreeOnTerminate := False;
+  inherited Create(False);
+end;
+
+procedure TAMQPReaderThread.Execute;
+var
+  LFrame: TAMQPFrame;
+begin
+  try
+    while not Terminated do
+    begin
+      LFrame := TAMQPFrame.ReadFrom(FConnection.FStream);
+      FConnection.DispatchFrame(LFrame);
+    end;
+    FConnection.ReadThreadFinished('');
+  except
+    on E: Exception do
+      // fim de stream (socket fechado) ou erro de protocolo: encerra a thread.
+      FConnection.ReadThreadFinished(E.Message);
+  end;
+end;
+
 { TAMQPConnection }
 
 constructor TAMQPConnection.Create(const AParams: TAMQPConnectionParams);
 begin
   inherited Create;
   FParams := AParams;
+  FWriteLock := TCriticalSection.Create;
+  FChannelsLock := TCriticalSection.Create;
+  FChannels := TDictionary<Word, TAMQPChannel>.Create;
+  FCloseOkEvent := TEvent.Create(nil, True, False, '');
 end;
 
 destructor TAMQPConnection.Destroy;
+var
+  LChan: TAMQPChannel;
 begin
   if FIsOpen then
     try
       Close;
     except
-      // fechando de qualquer forma; ignora erro de rede no encerramento
     end;
+  StopReadThread;
   FStream.Free;
   if Assigned(FSocket) then
   begin
@@ -223,22 +313,47 @@ begin
     end;
     FSocket.Free;
   end;
+  // Libera canais que o usuário não liberou (cada Free chama UnregisterChannel,
+  // que remove do dicionário; por isso iteramos sobre uma cópia).
+  if Assigned(FChannels) then
+  begin
+    for LChan in FChannels.Values.ToArray do
+      LChan.Free;
+    FChannels.Free;
+  end;
+  FChannelsLock.Free;
+  FWriteLock.Free;
+  FCloseOkEvent.Free;
   inherited;
 end;
 
-procedure TAMQPConnection.SendFrame(AFrameType: Byte; AChannel: Word;
+procedure TAMQPConnection.SendFrameNoLock(AFrameType: Byte; AChannel: Word;
   const APayload: TBytes);
 var
   LFrame: TAMQPFrame;
 begin
+  // Assume FWriteLock já adquirido (envio de grupo de frames, ex.: Publish).
   LFrame := TAMQPFrame.Create(AFrameType, AChannel, APayload);
   LFrame.WriteTo(FStream);
+end;
+
+procedure TAMQPConnection.SendFrame(AFrameType: Byte; AChannel: Word;
+  const APayload: TBytes);
+begin
+  FWriteLock.Enter;
+  try
+    SendFrameNoLock(AFrameType, AChannel, APayload);
+  finally
+    FWriteLock.Leave;
+  end;
 end;
 
 procedure TAMQPConnection.SendMethod(AChannel: Word; const APayload: TBytes);
 begin
   SendFrame(AMQP_FRAME_METHOD, AChannel, APayload);
 end;
+
+{ --- Leitura síncrona (só no handshake) --- }
 
 function TAMQPConnection.NextFrame: TAMQPFrame;
 begin
@@ -252,7 +367,6 @@ function TAMQPConnection.NextMethodOn(AExpectChannel: Word;
 var
   LFrame: TAMQPFrame;
   LConnClose: TAMQPConnectionClose;
-  LChanClose: TAMQPCloseInfo;
 begin
   LFrame := NextFrame;
   if not LFrame.IsMethod then
@@ -262,26 +376,14 @@ begin
   Result := TAMQPReader.Create(LFrame.Payload);
   try
     AId := ReadMethodHeader(Result);
-
     if AId.Matches(AMQP_CLASS_CONNECTION, AMQP_CONNECTION_CLOSE) then
     begin
       LConnClose := DecodeClose(Result);
-      FIsOpen := False;
-      raise EAMQPConnection.CreateFmt('conexão fechada pelo servidor: %d %s',
+      raise EAMQPConnection.CreateFmt('conexão recusada pelo servidor: %d %s',
         [LConnClose.ReplyCode, LConnClose.ReplyText]);
     end;
-
-    if AId.Matches(AMQP_CLASS_CHANNEL, AMQP_CHANNEL_CLOSE) then
-    begin
-      LChanClose := DecodeChannelClose(Result);
-      SendMethod(LFrame.Channel, BuildChannelCloseOk); // educadamente
-      raise EAMQPChannel.CreateFmt('canal %d fechado pelo servidor: %d %s',
-        [LFrame.Channel, LChanClose.ReplyCode, LChanClose.ReplyText]);
-    end;
-
     if LFrame.Channel <> AExpectChannel then
-      raise EAMQPConnection.CreateFmt(
-        'resposta em canal inesperado: %d (esperava %d)',
+      raise EAMQPConnection.CreateFmt('resposta em canal inesperado: %d (esperava %d)',
         [LFrame.Channel, AExpectChannel]);
   except
     Result.Free;
@@ -306,47 +408,6 @@ begin
   end;
 end;
 
-function TAMQPConnection.ReadContent(AExpectChannel: Word;
-  out AProps: TAMQPBasicProperties): TBytes;
-var
-  LFrame: TAMQPFrame;
-  LReader: TAMQPReader;
-  LHeader: TAMQPContentHeader;
-  LRemaining: UInt64;
-begin
-  // Content header (tipo 2)
-  LFrame := NextFrame;
-  if (LFrame.FrameType <> AMQP_FRAME_HEADER) or (LFrame.Channel <> AExpectChannel) then
-    raise EAMQPConnection.CreateFmt(
-      'esperava content header no canal %d (veio tipo %d, canal %d)',
-      [AExpectChannel, LFrame.FrameType, LFrame.Channel]);
-
-  LReader := TAMQPReader.Create(LFrame.Payload);
-  try
-    LHeader := DecodeContentHeader(LReader);
-  finally
-    LReader.Free;
-  end;
-  AProps := LHeader.Properties;
-
-  // Body frames (tipo 3) até somar body-size.
-  Result := nil;
-  LRemaining := LHeader.BodySize;
-  while LRemaining > 0 do
-  begin
-    LFrame := NextFrame;
-    if (LFrame.FrameType <> AMQP_FRAME_BODY) or (LFrame.Channel <> AExpectChannel) then
-      raise EAMQPConnection.CreateFmt(
-        'esperava content body no canal %d (veio tipo %d, canal %d)',
-        [AExpectChannel, LFrame.FrameType, LFrame.Channel]);
-    Result := Result + LFrame.Payload;
-    if UInt64(Length(LFrame.Payload)) >= LRemaining then
-      LRemaining := 0
-    else
-      Dec(LRemaining, Length(LFrame.Payload));
-  end;
-end;
-
 procedure TAMQPConnection.Handshake;
 var
   LReader: TAMQPReader;
@@ -356,7 +417,6 @@ var
 begin
   WriteProtocolHeader(FStream);
 
-  // Connection.Start
   LReader := ExpectMethod(AMQP_CHANNEL_CONNECTION, AMQP_CLASS_CONNECTION, AMQP_CONNECTION_START);
   try
     LStart := DecodeStart(LReader);
@@ -381,7 +441,6 @@ begin
     LStart.ServerProperties.Free;
   end;
 
-  // Connection.Tune
   LReader := ExpectMethod(AMQP_CHANNEL_CONNECTION, AMQP_CLASS_CONNECTION, AMQP_CONNECTION_TUNE);
   try
     LServerTune := DecodeTune(LReader);
@@ -393,7 +452,6 @@ begin
     FParams.ChannelMax, FParams.FrameMax, FParams.Heartbeat);
   SendMethod(AMQP_CHANNEL_CONNECTION, BuildTuneOk(FNegotiated));
 
-  // Connection.Open
   SendMethod(AMQP_CHANNEL_CONNECTION, BuildOpen(FParams.VirtualHost));
   LReader := ExpectMethod(AMQP_CHANNEL_CONNECTION, AMQP_CLASS_CONNECTION, AMQP_CONNECTION_OPEN_OK);
   try
@@ -401,8 +459,6 @@ begin
   finally
     LReader.Free;
   end;
-
-  FIsOpen := True;
 end;
 
 procedure TAMQPConnection.Open;
@@ -414,28 +470,145 @@ begin
   FSocket.Connect(FParams.Host, '', '', FParams.Port);
   FStream := TAMQPSocketStream.Create(FSocket);
 
-  Handshake;
+  Handshake;           // síncrono, antes da thread
+  FIsOpen := True;
+  StartReadThread;     // a partir daqui, só a thread lê o socket
+end;
+
+{ --- Thread de leitura --- }
+
+procedure TAMQPConnection.StartReadThread;
+begin
+  FReadThread := TAMQPReaderThread.Create(Self);
+end;
+
+procedure TAMQPConnection.StopReadThread;
+begin
+  if Assigned(FReadThread) then
+  begin
+    FReadThread.Terminate;
+    if Assigned(FSocket) then
+      try
+        FSocket.Close; // desbloqueia o ReadFrom da thread
+      except
+      end;
+    FReadThread.WaitFor;
+    FreeAndNil(FReadThread);
+  end;
+end;
+
+procedure TAMQPConnection.ReadThreadFinished(const AError: string);
+var
+  LChannels: TArray<TAMQPChannel>;
+  LChan: TAMQPChannel;
+  LMsg: string;
+begin
+  FIsOpen := False;
+  // Acorda quem estiver esperando Close-Ok e qualquer RPC pendente nos canais.
+  FCloseOkEvent.SetEvent;
+  if AError <> '' then
+    LMsg := 'conexão encerrada: ' + AError
+  else
+    LMsg := 'conexão encerrada';
+  FChannelsLock.Enter;
+  try
+    LChannels := FChannels.Values.ToArray;
+  finally
+    FChannelsLock.Leave;
+  end;
+  for LChan in LChannels do
+    LChan.SignalError(LMsg);
+end;
+
+procedure TAMQPConnection.DispatchFrame(const AFrame: TAMQPFrame);
+var
+  LChan: TAMQPChannel;
+begin
+  if AFrame.IsHeartbeat then
+    Exit; // heartbeat tratado no item 4
+
+  if AFrame.Channel = AMQP_CHANNEL_CONNECTION then
+  begin
+    HandleConnectionFrame(AFrame);
+    Exit;
+  end;
+
+  FChannelsLock.Enter;
+  try
+    if not FChannels.TryGetValue(AFrame.Channel, LChan) then
+      LChan := nil;
+    if Assigned(LChan) then
+      LChan.HandleFrame(AFrame);
+  finally
+    FChannelsLock.Leave;
+  end;
+end;
+
+procedure TAMQPConnection.HandleConnectionFrame(const AFrame: TAMQPFrame);
+var
+  LReader: TAMQPReader;
+  LId: TAMQPMethodId;
+  LClose: TAMQPConnectionClose;
+begin
+  if not AFrame.IsMethod then
+    Exit;
+  LReader := TAMQPReader.Create(AFrame.Payload);
+  try
+    LId := ReadMethodHeader(LReader);
+    if LId.Matches(AMQP_CLASS_CONNECTION, AMQP_CONNECTION_CLOSE_OK) then
+    begin
+      FCloseOkEvent.SetEvent;
+    end
+    else if LId.Matches(AMQP_CLASS_CONNECTION, AMQP_CONNECTION_CLOSE) then
+    begin
+      LClose := DecodeClose(LReader);
+      FIsOpen := False;
+      SendMethod(AMQP_CHANNEL_CONNECTION, BuildCloseOk);
+      FCloseOkEvent.SetEvent;
+      // (canais serão sinalizados quando a thread encerrar)
+    end;
+  finally
+    LReader.Free;
+  end;
+end;
+
+procedure TAMQPConnection.UnregisterChannel(AChannelId: Word);
+begin
+  FChannelsLock.Enter;
+  try
+    FChannels.Remove(AChannelId);
+  finally
+    FChannelsLock.Leave;
+  end;
 end;
 
 function TAMQPConnection.CreateChannel: TAMQPChannel;
+var
+  LChan: TAMQPChannel;
 begin
   if not FIsOpen then
     raise EAMQPConnection.Create('conexão não está aberta');
   Inc(FNextChannel);
-  Result := TAMQPChannel.Create(Self, FNextChannel);
+  LChan := TAMQPChannel.Create(Self, FNextChannel);
+  FChannelsLock.Enter;
   try
-    Result.Open;
+    FChannels.Add(LChan.ChannelId, LChan);
+  finally
+    FChannelsLock.Leave;
+  end;
+  try
+    LChan.Open; // RPC: usa a thread de leitura já rodando
   except
-    Result.Free;
+    UnregisterChannel(LChan.ChannelId);
+    LChan.Free;
     raise;
   end;
+  Result := LChan;
 end;
 
 procedure TAMQPConnection.Close(AReplyCode: Word; const AReplyText: string);
 var
   LClose: TAMQPConnectionClose;
-  LReader: TAMQPReader;
-  LId: TAMQPMethodId;
 begin
   if not FIsOpen then
     Exit;
@@ -445,13 +618,14 @@ begin
   LClose.ReplyText := AReplyText;
   LClose.ClassId := 0;
   LClose.MethodId := 0;
-  SendMethod(AMQP_CHANNEL_CONNECTION, BuildClose(LClose));
+  try
+    FCloseOkEvent.ResetEvent;
+    SendMethod(AMQP_CHANNEL_CONNECTION, BuildClose(LClose));
+    FCloseOkEvent.WaitFor(3000);
+  except
+  end;
 
-  // Aguarda Close-Ok (ignora o conteúdo).
-  LReader := NextMethodOn(AMQP_CHANNEL_CONNECTION, LId);
-  LReader.Free;
-
-  FSocket.Close;
+  StopReadThread; // termina a thread e fecha o socket
 end;
 
 { TAMQPChannel }
@@ -461,26 +635,80 @@ begin
   inherited Create;
   FConnection := AConnection;
   FChannelId := AChannelId;
+  FRpcLock := TCriticalSection.Create;
+  FRpcEvent := TEvent.Create(nil, True, False, '');
+  FAsmState := asIdle;
 end;
 
 destructor TAMQPChannel.Destroy;
 begin
-  if FIsOpen and FConnection.IsOpen then
+  if FIsOpen and (not FClosed) and FConnection.IsOpen then
     try
       Close;
     except
-      // ignora erro de rede ao encerrar
     end;
+  FRpcEvent.Free;
+  FRpcLock.Free;
   inherited;
+end;
+
+function TAMQPChannel.CallRpc(const ARequest: TBytes): TBytes;
+begin
+  FRpcLock.Enter;
+  try
+    if FClosed then
+      raise EAMQPChannel.Create('canal fechado');
+    FRpcKind := rkNone;
+    FRpcError := '';
+    FRpcEvent.ResetEvent;
+    FConnection.SendMethod(FChannelId, ARequest);
+    if FRpcEvent.WaitFor(AMQP_RPC_TIMEOUT_MS) <> wrSignaled then
+      raise EAMQPChannel.Create('timeout aguardando resposta do servidor');
+    case FRpcKind of
+      rkMethod:
+        Result := FRpcMethodPayload;
+      rkError:
+        raise EAMQPChannel.Create(FRpcError);
+    else
+      raise EAMQPChannel.Create('resposta de RPC inesperada');
+    end;
+  finally
+    FRpcLock.Leave;
+  end;
+end;
+
+procedure TAMQPChannel.SignalMethod(const APayload: TBytes);
+begin
+  FRpcMethodPayload := APayload;
+  FRpcKind := rkMethod;
+  FRpcEvent.SetEvent;
+end;
+
+procedure TAMQPChannel.SignalMessage(const AMessage: TAMQPGetResult);
+begin
+  FRpcMessage := AMessage;
+  FRpcKind := rkMessage;
+  FRpcEvent.SetEvent;
+end;
+
+procedure TAMQPChannel.SignalError(const AMessage: string);
+begin
+  FClosed := True;
+  FIsOpen := False;
+  FRpcError := AMessage;
+  FRpcKind := rkError;
+  FRpcEvent.SetEvent;
 end;
 
 procedure TAMQPChannel.Open;
 var
+  LPayload: TBytes;
   LReader: TAMQPReader;
 begin
-  FConnection.SendMethod(FChannelId, BuildChannelOpen);
-  LReader := FConnection.ExpectMethod(FChannelId, AMQP_CLASS_CHANNEL, AMQP_CHANNEL_OPEN_OK);
+  LPayload := CallRpc(BuildChannelOpen);
+  LReader := TAMQPReader.Create(LPayload);
   try
+    ReadMethodHeader(LReader);
     DecodeChannelOpenOk(LReader);
   finally
     LReader.Free;
@@ -489,33 +717,31 @@ begin
 end;
 
 procedure TAMQPChannel.DeclareExchange(const ADeclare: TAMQPExchangeDeclare);
-var
-  LReader: TAMQPReader;
 begin
-  FConnection.SendMethod(FChannelId, BuildExchangeDeclare(ADeclare));
   if ADeclare.NoWait then
+  begin
+    FConnection.SendMethod(FChannelId, BuildExchangeDeclare(ADeclare));
     Exit;
-  LReader := FConnection.ExpectMethod(FChannelId, AMQP_CLASS_EXCHANGE, AMQP_EXCHANGE_DECLARE_OK);
-  try
-    DecodeExchangeDeclareOk(LReader);
-  finally
-    LReader.Free;
   end;
+  CallRpc(BuildExchangeDeclare(ADeclare)); // Declare-Ok (sem args, descartado)
 end;
 
 function TAMQPChannel.DeclareQueue(const ADeclare: TAMQPQueueDeclare): TAMQPQueueDeclareOk;
 var
+  LPayload: TBytes;
   LReader: TAMQPReader;
 begin
-  FConnection.SendMethod(FChannelId, BuildQueueDeclare(ADeclare));
   if ADeclare.NoWait then
   begin
+    FConnection.SendMethod(FChannelId, BuildQueueDeclare(ADeclare));
     Result := Default(TAMQPQueueDeclareOk);
     Result.QueueName := ADeclare.QueueName;
     Exit;
   end;
-  LReader := FConnection.ExpectMethod(FChannelId, AMQP_CLASS_QUEUE, AMQP_QUEUE_DECLARE_OK);
+  LPayload := CallRpc(BuildQueueDeclare(ADeclare));
+  LReader := TAMQPReader.Create(LPayload);
   try
+    ReadMethodHeader(LReader);
     Result := DecodeQueueDeclareOk(LReader);
   finally
     LReader.Free;
@@ -523,18 +749,13 @@ begin
 end;
 
 procedure TAMQPChannel.BindQueue(const ABind: TAMQPQueueBind);
-var
-  LReader: TAMQPReader;
 begin
-  FConnection.SendMethod(FChannelId, BuildQueueBind(ABind));
   if ABind.NoWait then
+  begin
+    FConnection.SendMethod(FChannelId, BuildQueueBind(ABind));
     Exit;
-  LReader := FConnection.ExpectMethod(FChannelId, AMQP_CLASS_QUEUE, AMQP_QUEUE_BIND_OK);
-  try
-    DecodeQueueBindOk(LReader);
-  finally
-    LReader.Free;
   end;
+  CallRpc(BuildQueueBind(ABind)); // Bind-Ok (sem args, descartado)
 end;
 
 procedure TAMQPChannel.Publish(const AExchange, ARoutingKey: string;
@@ -542,15 +763,6 @@ procedure TAMQPChannel.Publish(const AExchange, ARoutingKey: string;
 var
   LMaxBody, LOffset, LLen: Integer;
 begin
-  // 1) frame de método Basic.Publish
-  FConnection.SendMethod(FChannelId,
-    BuildBasicPublish(AExchange, ARoutingKey, AMandatory, False));
-
-  // 2) frame de content header
-  FConnection.SendFrame(AMQP_FRAME_HEADER, FChannelId,
-    BuildContentHeader(UInt64(Length(ABody)), AProps));
-
-  // 3) frames de corpo, respeitando o frame-max negociado (7 header + 1 end = 8).
   if FConnection.FNegotiated.FrameMax = 0 then
     LMaxBody := 131072 - 8
   else
@@ -558,15 +770,28 @@ begin
   if LMaxBody < 1 then
     LMaxBody := 1;
 
-  LOffset := 0;
-  while LOffset < Length(ABody) do
-  begin
-    if (Length(ABody) - LOffset) < LMaxBody then
-      LLen := Length(ABody) - LOffset
-    else
-      LLen := LMaxBody;
-    FConnection.SendFrame(AMQP_FRAME_BODY, FChannelId, Copy(ABody, LOffset, LLen));
-    Inc(LOffset, LLen);
+  // Os frames de uma mensagem (método + header + body) devem sair juntos, sem
+  // que frames de outra thread se intercalem — por isso, um único lock.
+  FConnection.FWriteLock.Enter;
+  try
+    FConnection.SendFrameNoLock(AMQP_FRAME_METHOD, FChannelId,
+      BuildBasicPublish(AExchange, ARoutingKey, AMandatory, False));
+    FConnection.SendFrameNoLock(AMQP_FRAME_HEADER, FChannelId,
+      BuildContentHeader(UInt64(Length(ABody)), AProps));
+
+    LOffset := 0;
+    while LOffset < Length(ABody) do
+    begin
+      if (Length(ABody) - LOffset) < LMaxBody then
+        LLen := Length(ABody) - LOffset
+      else
+        LLen := LMaxBody;
+      FConnection.SendFrameNoLock(AMQP_FRAME_BODY, FChannelId,
+        Copy(ABody, LOffset, LLen));
+      Inc(LOffset, LLen);
+    end;
+  finally
+    FConnection.FWriteLock.Leave;
   end;
 end;
 
@@ -583,36 +808,33 @@ begin
 end;
 
 function TAMQPChannel.BasicGet(const AQueue: string; ANoAck: Boolean): TAMQPGetResult;
-var
-  LReader: TAMQPReader;
-  LId: TAMQPMethodId;
-  LGetOk: TAMQPBasicGetOk;
 begin
-  Result := Default(TAMQPGetResult);
-  FConnection.SendMethod(FChannelId, BuildBasicGet(AQueue, ANoAck));
-
-  LReader := FConnection.NextMethodOn(FChannelId, LId);
+  FRpcLock.Enter;
   try
-    if LId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_GET_EMPTY) then
-    begin
-      Result.Found := False;
-      Exit;
+    if FClosed then
+      raise EAMQPChannel.Create('canal fechado');
+    FRpcKind := rkNone;
+    FRpcError := '';
+    FRpcEvent.ResetEvent;
+    FConnection.SendMethod(FChannelId, BuildBasicGet(AQueue, ANoAck));
+    if FRpcEvent.WaitFor(AMQP_RPC_TIMEOUT_MS) <> wrSignaled then
+      raise EAMQPChannel.Create('timeout aguardando resposta do servidor');
+    case FRpcKind of
+      rkMessage:
+        Result := FRpcMessage;      // Get-Ok (Found=True veio da montagem)
+      rkMethod:
+        begin                       // Get-Empty
+          Result := Default(TAMQPGetResult);
+          Result.Found := False;
+        end;
+      rkError:
+        raise EAMQPChannel.Create(FRpcError);
+    else
+      raise EAMQPChannel.Create('resposta de RPC inesperada');
     end;
-    if not LId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_GET_OK) then
-      raise EAMQPChannel.CreateFmt('esperava Get-Ok/Get-Empty, veio %d/%d',
-        [LId.ClassId, LId.MethodId]);
-    LGetOk := DecodeBasicGetOk(LReader);
   finally
-    LReader.Free;
+    FRpcLock.Leave;
   end;
-
-  Result.Found := True;
-  Result.DeliveryTag := LGetOk.DeliveryTag;
-  Result.Redelivered := LGetOk.Redelivered;
-  Result.Exchange := LGetOk.Exchange;
-  Result.RoutingKey := LGetOk.RoutingKey;
-  Result.MessageCount := LGetOk.MessageCount;
-  Result.Body := FConnection.ReadContent(FChannelId, Result.Properties);
 end;
 
 procedure TAMQPChannel.Ack(ADeliveryTag: UInt64; AMultiple: Boolean);
@@ -628,20 +850,128 @@ end;
 procedure TAMQPChannel.Close(AReplyCode: Word; const AReplyText: string);
 var
   LClose: TAMQPCloseInfo;
-  LReader: TAMQPReader;
 begin
-  if not FIsOpen then
+  if FClosed or (not FIsOpen) then
     Exit;
-  FIsOpen := False;
 
   LClose.ReplyCode := AReplyCode;
   LClose.ReplyText := AReplyText;
   LClose.ClassId := 0;
   LClose.MethodId := 0;
-  FConnection.SendMethod(FChannelId, BuildChannelClose(LClose));
+  try
+    CallRpc(BuildChannelClose(LClose)); // aguarda Channel.Close-Ok
+  except
+    // se falhar (conexão caiu etc.), segue fechando localmente
+  end;
+  FClosed := True;
+  FIsOpen := False;
+  FConnection.UnregisterChannel(FChannelId);
+end;
 
-  LReader := FConnection.ExpectMethod(FChannelId, AMQP_CLASS_CHANNEL, AMQP_CHANNEL_CLOSE_OK);
-  LReader.Free;
+{ TAMQPChannel — recepção (roda na thread de leitura) }
+
+procedure TAMQPChannel.CompleteContent;
+var
+  LMsg: TAMQPGetResult;
+begin
+  FAsmState := asIdle;
+  if FAsmMethodId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_GET_OK) then
+  begin
+    LMsg := Default(TAMQPGetResult);
+    LMsg.Found := True;
+    LMsg.DeliveryTag := FAsmGetOk.DeliveryTag;
+    LMsg.Redelivered := FAsmGetOk.Redelivered;
+    LMsg.Exchange := FAsmGetOk.Exchange;
+    LMsg.RoutingKey := FAsmGetOk.RoutingKey;
+    LMsg.MessageCount := FAsmGetOk.MessageCount;
+    LMsg.Properties := FAsmProps;
+    LMsg.Body := FAsmBody;
+    SignalMessage(LMsg);
+  end;
+  // Basic.Deliver / Basic.Return: tratados no item 3b / futuro.
+  FAsmBody := nil;
+end;
+
+procedure TAMQPChannel.HandleFrame(const AFrame: TAMQPFrame);
+var
+  LReader: TAMQPReader;
+  LId: TAMQPMethodId;
+  LClose: TAMQPCloseInfo;
+  LHeader: TAMQPContentHeader;
+begin
+  case FAsmState of
+    asHeader:
+      begin
+        if AFrame.FrameType <> AMQP_FRAME_HEADER then
+          Exit; // frame fora de ordem: ignora (protocolo)
+        LReader := TAMQPReader.Create(AFrame.Payload);
+        try
+          LHeader := DecodeContentHeader(LReader);
+        finally
+          LReader.Free;
+        end;
+        FAsmProps := LHeader.Properties;
+        FAsmBody := nil;
+        FAsmRemaining := LHeader.BodySize;
+        if FAsmRemaining = 0 then
+          CompleteContent
+        else
+          FAsmState := asBody;
+        Exit;
+      end;
+
+    asBody:
+      begin
+        if AFrame.FrameType <> AMQP_FRAME_BODY then
+          Exit;
+        FAsmBody := FAsmBody + AFrame.Payload;
+        if UInt64(Length(AFrame.Payload)) >= FAsmRemaining then
+          FAsmRemaining := 0
+        else
+          Dec(FAsmRemaining, Length(AFrame.Payload));
+        if FAsmRemaining = 0 then
+          CompleteContent;
+        Exit;
+      end;
+  end;
+
+  // asIdle: espera um frame de método.
+  if not AFrame.IsMethod then
+    Exit;
+
+  LReader := TAMQPReader.Create(AFrame.Payload);
+  try
+    LId := ReadMethodHeader(LReader);
+
+    if LId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_GET_OK) then
+    begin
+      FAsmMethodId := LId;
+      FAsmGetOk := DecodeBasicGetOk(LReader);
+      FAsmState := asHeader;
+    end
+    else if LId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_DELIVER) or
+            LId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_RETURN) then
+    begin
+      // conteúdo que ainda não consumimos (item 3b): guarda o método e drena o
+      // content header/body para não dessincronizar o stream.
+      FAsmMethodId := LId;
+      FAsmState := asHeader;
+    end
+    else if LId.Matches(AMQP_CLASS_CHANNEL, AMQP_CHANNEL_CLOSE) then
+    begin
+      LClose := DecodeChannelClose(LReader);
+      FConnection.SendMethod(FChannelId, BuildChannelCloseOk);
+      SignalError(Format('canal %d fechado pelo servidor: %d %s',
+        [FChannelId, LClose.ReplyCode, LClose.ReplyText]));
+    end
+    else
+    begin
+      // resposta de RPC (Open-Ok, Declare-Ok, Bind-Ok, Get-Empty, Close-Ok, ...)
+      SignalMethod(AFrame.Payload);
+    end;
+  finally
+    LReader.Free;
+  end;
 end;
 
 end.
