@@ -324,7 +324,6 @@ uses
 
 const
   AMQP_RPC_TIMEOUT_MS = 30000; // tempo máximo aguardando resposta de RPC
-  AMQP_DRAIN_TIMEOUT_MS = 5000; // tempo máximo drenando callbacks ao fechar
 
 { TAMQPGetResult }
 
@@ -398,7 +397,8 @@ begin
     while not Terminated do
     begin
       LFrame := TAMQPFrame.ReadFrom(FConnection.FStream);
-      FConnection.FLastReadTick := TThread.GetTickCount64;
+      TInterlocked.Exchange(FConnection.FLastReadTick,
+        TThread.GetTickCount64); // atômico p/ a thread de heartbeat
       FConnection.DispatchFrame(LFrame);
     end;
     FConnection.ReadThreadFinished('');
@@ -484,7 +484,9 @@ begin
     raise EAMQPConnection.Create('conexão indisponível no momento (reconectando?)');
   LFrame := TAMQPFrame.Create(AFrameType, AChannel, APayload);
   LFrame.WriteTo(FStream);
-  FLastWriteTick := TThread.GetTickCount64;
+  // Atômico: lido pela thread de heartbeat; no Win32 um store de 64 bits não é
+  // atômico e poderia ser "torn" (ver TInterlocked em HeartbeatTick).
+  TInterlocked.Exchange(FLastWriteTick, TThread.GetTickCount64);
 end;
 
 procedure TAMQPConnection.SendFrame(AFrameType: Byte; AChannel: Word;
@@ -708,16 +710,20 @@ end;
 procedure TAMQPConnection.HeartbeatTick;
 var
   LIntervalMs: UInt64;
-  LNow: UInt64;
+  LNow, LLastRead, LLastWrite: UInt64;
 begin
   LIntervalMs := UInt64(FNegotiated.Heartbeat) * 1000;
   if LIntervalMs = 0 then
     Exit;
   LNow := TThread.GetTickCount64;
+  // Leituras atômicas (os ticks são escritos por outras threads; no Win32 um
+  // load de 64 bits pode ser "torn" e produzir um delta absurdo).
+  LLastRead := TInterlocked.Read(FLastReadTick);
+  LLastWrite := TInterlocked.Read(FLastWriteTick);
 
   // Conexão morta: nenhum frame recebido em 2x o intervalo (o servidor também
   // manda heartbeats). Fecha o socket para desbloquear a thread de leitura.
-  if (LNow - FLastReadTick) > (2 * LIntervalMs) then
+  if (LNow - LLastRead) > (2 * LIntervalMs) then
   begin
     if Assigned(FSocket) then
       try
@@ -728,7 +734,7 @@ begin
   end;
 
   // Envio ocioso há >= metade do intervalo: manda um heartbeat.
-  if (LNow - FLastWriteTick) >= (LIntervalMs div 2) then
+  if (LNow - LLastWrite) >= (LIntervalMs div 2) then
     try
       SendFrame(AMQP_FRAME_HEARTBEAT, AMQP_CHANNEL_CONNECTION, nil);
     except
@@ -935,16 +941,29 @@ var
 begin
   if not FIsOpen then
     raise EAMQPConnection.Create('conexão não está aberta');
-  Inc(FNextChannel);
-  LChan := TAMQPChannel.Create(Self, FNextChannel);
+
+  // Alocação do id + inserção no dicionário sob o mesmo lock (evita duas threads
+  // gerarem o mesmo channel-id e o segundo Add levantar/vazar o canal).
   FChannelsLock.Enter;
   try
-    FChannels.Add(LChan.ChannelId, LChan);
+    if (FNegotiated.ChannelMax > 0) and (FNextChannel >= FNegotiated.ChannelMax) then
+      raise EAMQPConnection.CreateFmt(
+        'limite de canais atingido (%d); reuso de canais ainda não implementado',
+        [FNegotiated.ChannelMax]);
+    Inc(FNextChannel);
+    LChan := TAMQPChannel.Create(Self, FNextChannel);
+    try
+      FChannels.Add(LChan.ChannelId, LChan);
+    except
+      LChan.Free;
+      raise;
+    end;
   finally
     FChannelsLock.Leave;
   end;
+
   try
-    LChan.Open; // RPC: usa a thread de leitura já rodando
+    LChan.Open; // RPC: usa a thread de leitura já rodando (fora do lock)
   except
     UnregisterChannel(LChan.ChannelId);
     LChan.Free;
@@ -1347,14 +1366,19 @@ end;
 
 procedure TAMQPChannel.Cancel(const AConsumerTag: string);
 begin
-  CallRpc(BuildBasicCancel(AConsumerTag, False)); // Cancel-Ok
-  FConsumersLock.Enter;
+  // O cleanup local roda mesmo se CallRpc falhar (canal caiu / timeout): senão o
+  // consumer ficaria em FRecovery e seria ressuscitado numa eventual reconexão.
   try
-    FConsumers.Remove(AConsumerTag);
+    CallRpc(BuildBasicCancel(AConsumerTag, False)); // Cancel-Ok
   finally
-    FConsumersLock.Leave;
+    FConsumersLock.Enter;
+    try
+      FConsumers.Remove(AConsumerTag);
+    finally
+      FConsumersLock.Leave;
+    end;
+    RemoveConsumerRecovery(AConsumerTag);
   end;
-  RemoveConsumerRecovery(AConsumerTag);
 end;
 
 procedure TAMQPChannel.DispatchDelivery(const ADeliver: TAMQPBasicDeliver;
@@ -1404,16 +1428,13 @@ begin
 end;
 
 procedure TAMQPChannel.DrainInFlight;
-var
-  LWaited: Integer;
 begin
-  LWaited := 0;
-  while (TInterlocked.CompareExchange(FInFlight, 0, 0) > 0) and
-        (LWaited < AMQP_DRAIN_TIMEOUT_MS) do
-  begin
+  // Espera SEM timeout: liberar o canal com um callback ainda em execução seria
+  // use-after-free (o TTask capturou Self e ainda mexe em FInFlight/FConnection).
+  // Um callback bem-comportado sempre termina — mesmo que faça IO de 5s+ (o caso
+  // de uso alvo). Não chame Close de dentro do próprio callback (auto-espera).
+  while TInterlocked.CompareExchange(FInFlight, 0, 0) > 0 do
     TThread.Sleep(10);
-    Inc(LWaited, 10);
-  end;
 end;
 
 procedure TAMQPChannel.Close(AReplyCode: Word; const AReplyText: string);
@@ -1461,8 +1482,18 @@ begin
     SignalMessage(LMsg);
   end
   else if FAsmMethodId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_DELIVER) then
-    DispatchDelivery(FAsmDeliver, FAsmProps, FAsmBody);
-  // Basic.Return: descartado por ora (mensagem não roteável em publish mandatory).
+    DispatchDelivery(FAsmDeliver, FAsmProps, FAsmBody)
+  else
+  begin
+    // Basic.Return (publish mandatory não roteado) ou outro: descartamos o
+    // conteúdo. Como ninguém assume a posse das Properties aqui, liberamos a
+    // tabela de Headers se ela veio (senão vazaria a cada Return).
+    if FAsmProps.Has(bpHeaders) and Assigned(FAsmProps.Headers) then
+    begin
+      FAsmProps.Headers.Free;
+      FAsmProps.Headers := nil;
+    end;
+  end;
   FAsmBody := nil;
 end;
 

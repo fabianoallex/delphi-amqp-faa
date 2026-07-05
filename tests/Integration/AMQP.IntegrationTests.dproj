@@ -81,6 +81,7 @@
         <DCCReference Include="AMQP.ChannelIntegrationTests.pas"/>
         <DCCReference Include="AMQP.ConsumeIntegrationTests.pas"/>
         <DCCReference Include="AMQP.ReconnectIntegrationTests.pas"/>
+        <DCCReference Include="AMQP.ReviewRegressionTests.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>
