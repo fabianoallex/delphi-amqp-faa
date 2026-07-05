@@ -201,10 +201,40 @@ Abra `AMQP.groupproj` no RAD Studio.
   nome gerado pelo servidor recebem um novo nome ao serem redeclaradas.
 - `Basic.Return` (mensagem `mandatory` não roteável) é descartado por ora.
 
+## Integração com delphi-api-infra-faa
+
+`src/Messaging.Adapters.DelphiAmqpFaa.pas` implementa o contrato de
+mensageria agnóstico de `delphi-api-infra-faa` (`Messaging.Interfaces`:
+`IMessagingFactory`, `IMessageConsumer`, `IMessagePublisher`,
+`IMessagePayload`). Fica fora do núcleo da lib — quem só quer o cliente AMQP
+não precisa da infra no *search path*; quem quiser o padrão de registry da
+infra inclui essa unit, que se registra sozinha (nome `'rabbitmq'`) na
+`initialization`.
+
+Requer, no projeto consumidor, os dois *search paths*:
+- a pasta `src` desta lib;
+- `src/Messaging` de `delphi-api-infra-faa` (unit `Messaging.Interfaces`).
+
+```pascal
+uses
+  Messaging.Adapters.Registry,
+  Messaging.Adapters.DelphiAmqpFaa; // basta estar no uses para se registrar
+
+LFactory  := TMessagingRegistry.GetFactory('rabbitmq');
+LConsumer := LFactory.CreateConsumer(LConfig);
+LConsumer.Subscribe('nfe.respostas', TMeuHandler.Create(LService));
+LConsumer.Start;
+```
+
+Mapeamento de ack: o adapter confirma (`Ack`) após `IMessageHandler.Handle`
+retornar sem erro, e devolve à fila (`Nack` com requeue) se o handler
+levantar exceção — at-least-once por padrão, com prefetch 20.
+
 ## Roadmap
 
 Itens 1–4 concluídos (framing/handshake, canais + publish/get, consumo
-concorrente + ack, heartbeat + reconexão). Ver [CLAUDE.md](CLAUDE.md).
+concorrente + ack, heartbeat + reconexão), mais o adapter para
+`delphi-api-infra-faa`. Ver [CLAUDE.md](CLAUDE.md).
 
 ## Licença
 

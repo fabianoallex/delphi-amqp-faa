@@ -36,10 +36,13 @@ Isso exige da lib: publish/consume confiável, ack manual (at-least-once), e um 
 
 ## Roadmap (MVP, pensado para ~30 dias de dedicação)
 
-1. Framing binário + handshake de conexão (`AMQP0091` header, `Start/Start-Ok/Tune/Tune-Ok/Open/Open-Ok`), validado contra RabbitMQ real via Docker.
-2. Canais + encode/decode de métodos básicos (`exchange.*`, `queue.*`) + `Basic.Publish`.
-3. `Basic.Consume` + ack/nack manual + despacho de callback para thread pool.
-4. Heartbeat (thread própria) + reconexão + polimento/documentação.
+1. ~~Framing binário + handshake de conexão (`AMQP0091` header, `Start/Start-Ok/Tune/Tune-Ok/Open/Open-Ok`), validado contra RabbitMQ real via Docker.~~ **Concluído.**
+2. ~~Canais + encode/decode de métodos básicos (`exchange.*`, `queue.*`) + `Basic.Publish`.~~ **Concluído.**
+3. ~~`Basic.Consume` + ack/nack manual + despacho de callback para thread pool.~~ **Concluído.**
+4. ~~Heartbeat (thread própria) + reconexão + polimento/documentação.~~ **Concluído.** Passou por revisão (ultrareview) com correções aplicadas.
+5. ~~Adapter para `delphi-api-infra-faa` (`Messaging.Adapters.DelphiAmqpFaa.pas`, implementa `IMessagingFactory`/`IMessageConsumer`/`IMessagePublisher`, registra-se como `'rabbitmq'`).~~ **Concluído.**
+
+MVP completo. Próximos passos possíveis (não bloqueiam uso): publisher confirms/transações, recuperação de topologia para filas com nome gerado pelo servidor, tratamento de `Basic.Return`.
 
 ## Testes
 
