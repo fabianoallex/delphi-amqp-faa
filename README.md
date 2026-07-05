@@ -169,6 +169,14 @@ simultâneos**. O consumo com thread pool + ack manual atende isso diretamente �
 cada resposta é processada em paralelo, correlacionada pela chave da NFe
 (`CorrelationId` ou um header), e só é confirmada após o processamento.
 
+Exemplo executável em `samples/AutorizadorSim` (publica N retornos simulados)
+e `samples/Retaguarda` (consome e processa concorrentemente, com um comando
+de status no console). Suba o broker (`docker compose -f
+docker/docker-compose.yml up -d`), rode o `Retaguarda` e, em seguida, o
+`AutorizadorSim` — as linhas `[worker N] iniciando...` de notas diferentes
+aparecem intercaladas no console do `Retaguarda`, confirmando o processamento
+em paralelo.
+
 ## Arquitetura (resumo)
 
 - **Uma thread de leitura** é a única que lê o socket após o handshake; ela

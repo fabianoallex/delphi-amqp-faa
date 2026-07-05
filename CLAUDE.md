@@ -34,6 +34,8 @@ Fluxo real: PDV → aplicação → autorizador (gera XML da NFe, envia à SEFAZ
 
 Isso exige da lib: publish/consume confiável, ack manual (at-least-once), e um modelo de consumo que não serialize o processamento de mensagens diferentes.
 
+Demonstrado em `samples/AutorizadorSim` + `samples/Retaguarda` (portados do repositório de estudo `delphi/amqp`, que usava o fork do comotobo — lá o despacho para thread pool era manual via `TTask.Run`; aqui `Channel.Consume` já despacha nativamente, então o callback do sample chama `ProcessarChave` direto).
+
 ## Roadmap (MVP, pensado para ~30 dias de dedicação)
 
 1. ~~Framing binário + handshake de conexão (`AMQP0091` header, `Start/Start-Ok/Tune/Tune-Ok/Open/Open-Ok`), validado contra RabbitMQ real via Docker.~~ **Concluído.**
