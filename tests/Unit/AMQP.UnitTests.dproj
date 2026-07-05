@@ -72,9 +72,14 @@
         <DCCReference Include="..\..\src\AMQP.Frame.pas"/>
         <DCCReference Include="..\..\src\AMQP.Method.pas"/>
         <DCCReference Include="..\..\src\AMQP.Connection.Methods.pas"/>
+        <DCCReference Include="..\..\src\AMQP.Channel.Methods.pas"/>
+        <DCCReference Include="..\..\src\AMQP.Exchange.Methods.pas"/>
+        <DCCReference Include="..\..\src\AMQP.Queue.Methods.pas"/>
+        <DCCReference Include="..\..\src\AMQP.Basic.Methods.pas"/>
         <DCCReference Include="AMQP.WireTests.pas"/>
         <DCCReference Include="AMQP.FrameTests.pas"/>
         <DCCReference Include="AMQP.ConnectionMethodsTests.pas"/>
+        <DCCReference Include="AMQP.Item2MethodsTests.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
         </BuildConfiguration>

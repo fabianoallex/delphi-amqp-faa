@@ -13,8 +13,13 @@ uses
   AMQP.Frame in '..\..\src\AMQP.Frame.pas',
   AMQP.Method in '..\..\src\AMQP.Method.pas',
   AMQP.Connection.Methods in '..\..\src\AMQP.Connection.Methods.pas',
+  AMQP.Channel.Methods in '..\..\src\AMQP.Channel.Methods.pas',
+  AMQP.Exchange.Methods in '..\..\src\AMQP.Exchange.Methods.pas',
+  AMQP.Queue.Methods in '..\..\src\AMQP.Queue.Methods.pas',
+  AMQP.Basic.Methods in '..\..\src\AMQP.Basic.Methods.pas',
   AMQP.Connection in '..\..\src\AMQP.Connection.pas',
-  AMQP.HandshakeIntegrationTests in 'AMQP.HandshakeIntegrationTests.pas';
+  AMQP.HandshakeIntegrationTests in 'AMQP.HandshakeIntegrationTests.pas',
+  AMQP.ChannelIntegrationTests in 'AMQP.ChannelIntegrationTests.pas';
 
 var
   runner: ITestRunner;

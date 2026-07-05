@@ -13,9 +13,14 @@ uses
   AMQP.Frame in '..\..\src\AMQP.Frame.pas',
   AMQP.Method in '..\..\src\AMQP.Method.pas',
   AMQP.Connection.Methods in '..\..\src\AMQP.Connection.Methods.pas',
+  AMQP.Channel.Methods in '..\..\src\AMQP.Channel.Methods.pas',
+  AMQP.Exchange.Methods in '..\..\src\AMQP.Exchange.Methods.pas',
+  AMQP.Queue.Methods in '..\..\src\AMQP.Queue.Methods.pas',
+  AMQP.Basic.Methods in '..\..\src\AMQP.Basic.Methods.pas',
   AMQP.WireTests in 'AMQP.WireTests.pas',
   AMQP.FrameTests in 'AMQP.FrameTests.pas',
-  AMQP.ConnectionMethodsTests in 'AMQP.ConnectionMethodsTests.pas';
+  AMQP.ConnectionMethodsTests in 'AMQP.ConnectionMethodsTests.pas',
+  AMQP.Item2MethodsTests in 'AMQP.Item2MethodsTests.pas';
 
 var
   runner: ITestRunner;

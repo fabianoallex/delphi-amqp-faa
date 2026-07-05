@@ -63,6 +63,41 @@ const
   AMQP_CHANNEL_CLOSE    = 40;
   AMQP_CHANNEL_CLOSE_OK  = 41;
 
+  // --- Metodos de Exchange (classe 40) ------------------------------------
+  AMQP_EXCHANGE_DECLARE    = 10;
+  AMQP_EXCHANGE_DECLARE_OK  = 11;
+  AMQP_EXCHANGE_DELETE     = 20;
+  AMQP_EXCHANGE_DELETE_OK   = 21;
+
+  // --- Metodos de Queue (classe 50) ---------------------------------------
+  AMQP_QUEUE_DECLARE    = 10;
+  AMQP_QUEUE_DECLARE_OK  = 11;
+  AMQP_QUEUE_BIND       = 20;
+  AMQP_QUEUE_BIND_OK     = 21;
+  AMQP_QUEUE_UNBIND     = 50;
+  AMQP_QUEUE_UNBIND_OK   = 51;
+  AMQP_QUEUE_PURGE      = 30;
+  AMQP_QUEUE_PURGE_OK    = 31;
+  AMQP_QUEUE_DELETE     = 40;
+  AMQP_QUEUE_DELETE_OK   = 41;
+
+  // --- Metodos de Basic (classe 60) ---------------------------------------
+  AMQP_BASIC_QOS        = 10;
+  AMQP_BASIC_QOS_OK      = 11;
+  AMQP_BASIC_CONSUME    = 20;
+  AMQP_BASIC_CONSUME_OK  = 21;
+  AMQP_BASIC_CANCEL     = 30;
+  AMQP_BASIC_CANCEL_OK   = 31;
+  AMQP_BASIC_PUBLISH    = 40;
+  AMQP_BASIC_RETURN     = 50;
+  AMQP_BASIC_DELIVER    = 60;
+  AMQP_BASIC_GET        = 70;
+  AMQP_BASIC_GET_OK      = 71;
+  AMQP_BASIC_GET_EMPTY   = 72;
+  AMQP_BASIC_ACK        = 80;
+  AMQP_BASIC_REJECT     = 90;
+  AMQP_BASIC_NACK       = 120;
+
 implementation
 
 end.
