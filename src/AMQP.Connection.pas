@@ -88,6 +88,25 @@ type
   end;
 
   TAMQPConnection = class;
+  TAMQPChannel = class;
+
+  { Mensagem entregue a um consumer (Basic.Deliver). Se Properties tiver
+    Headers, a tabela é liberada automaticamente após o callback retornar. }
+  TAMQPDelivery = record
+    ConsumerTag: string;
+    DeliveryTag: UInt64;
+    Redelivered: Boolean;
+    Exchange: string;
+    RoutingKey: string;
+    Properties: TAMQPBasicProperties;
+    Body: TBytes;
+    function BodyAsText: string;
+  end;
+
+  { Callback de consumer. Roda numa thread do pool (TTask), então NÃO bloqueia a
+    thread de leitura. Use AChannel.Ack(ADelivery.DeliveryTag) para confirmar. }
+  TAMQPConsumerCallback = reference to procedure(AChannel: TAMQPChannel;
+    const ADelivery: TAMQPDelivery);
 
   TAMQPRpcKind = (rkNone, rkMethod, rkMessage, rkError);
 
@@ -110,9 +129,15 @@ type
     FAsmState: (asIdle, asHeader, asBody);
     FAsmMethodId: TAMQPMethodId;
     FAsmGetOk: TAMQPBasicGetOk;
+    FAsmDeliver: TAMQPBasicDeliver;
     FAsmProps: TAMQPBasicProperties;
     FAsmBody: TBytes;
     FAsmRemaining: UInt64;
+    // --- consumers ---
+    FConsumers: TDictionary<string, TAMQPConsumerCallback>;
+    FConsumersLock: TCriticalSection;
+    FConsumerCounter: Integer;
+    FInFlight: Integer; // callbacks em execução no pool (atômico)
     procedure Open;
     /// Envia um método e aguarda a resposta (payload do método de resposta).
     function CallRpc(const ARequest: TBytes): TBytes;
@@ -121,6 +146,11 @@ type
     procedure SignalMessage(const AMessage: TAMQPGetResult);
     procedure SignalError(const AMessage: string);
     procedure CompleteContent;
+    /// Despacha uma entrega para o callback do consumer, no thread pool.
+    procedure DispatchDelivery(const ADeliver: TAMQPBasicDeliver;
+      const AProps: TAMQPBasicProperties; const ABody: TBytes);
+    /// Aguarda os callbacks em voo terminarem (usado ao fechar o canal).
+    procedure DrainInFlight;
     /// Trata um frame entregue pela thread de leitura (roda NA thread de leitura).
     procedure HandleFrame(const AFrame: TAMQPFrame);
   public
@@ -143,6 +173,17 @@ type
     procedure Ack(ADeliveryTag: UInt64; AMultiple: Boolean = False);
     procedure Nack(ADeliveryTag: UInt64; ARequeue: Boolean = True;
       AMultiple: Boolean = False);
+
+    /// Limita quantas mensagens não confirmadas o servidor entrega por vez
+    /// (prefetch). Útil para dividir a carga entre os callbacks concorrentes.
+    procedure Qos(APrefetchCount: Word; AGlobal: Boolean = False);
+    /// Inicia o consumo da fila. Cada mensagem chega em ACallback, despachado
+    /// num thread do pool. Devolve o consumer-tag (use em Cancel). Com
+    /// ANoAck=False (padrão), confirme com AChannel.Ack no callback.
+    function Consume(const AQueue: string; const ACallback: TAMQPConsumerCallback;
+      ANoAck: Boolean = False; AExclusive: Boolean = False): string;
+    /// Cancela um consumer pelo tag.
+    procedure Cancel(const AConsumerTag: string);
 
     procedure Close(AReplyCode: Word = 200; const AReplyText: string = 'OK');
 
@@ -206,14 +247,23 @@ type
 implementation
 
 uses
+  System.Threading,
   AMQP.Channel.Methods;
 
 const
   AMQP_RPC_TIMEOUT_MS = 30000; // tempo máximo aguardando resposta de RPC
+  AMQP_DRAIN_TIMEOUT_MS = 5000; // tempo máximo drenando callbacks ao fechar
 
 { TAMQPGetResult }
 
 function TAMQPGetResult.BodyAsText: string;
+begin
+  Result := TEncoding.UTF8.GetString(Body);
+end;
+
+{ TAMQPDelivery }
+
+function TAMQPDelivery.BodyAsText: string;
 begin
   Result := TEncoding.UTF8.GetString(Body);
 end;
@@ -637,6 +687,8 @@ begin
   FChannelId := AChannelId;
   FRpcLock := TCriticalSection.Create;
   FRpcEvent := TEvent.Create(nil, True, False, '');
+  FConsumers := TDictionary<string, TAMQPConsumerCallback>.Create;
+  FConsumersLock := TCriticalSection.Create;
   FAsmState := asIdle;
 end;
 
@@ -647,6 +699,9 @@ begin
       Close;
     except
     end;
+  DrainInFlight; // garante que nenhum callback ainda usa este canal
+  FConsumers.Free;
+  FConsumersLock.Free;
   FRpcEvent.Free;
   FRpcLock.Free;
   inherited;
@@ -847,6 +902,113 @@ begin
   FConnection.SendMethod(FChannelId, BuildBasicNack(ADeliveryTag, AMultiple, ARequeue));
 end;
 
+procedure TAMQPChannel.Qos(APrefetchCount: Word; AGlobal: Boolean);
+begin
+  CallRpc(BuildBasicQos(APrefetchCount, AGlobal)); // Qos-Ok (sem args)
+end;
+
+function TAMQPChannel.Consume(const AQueue: string;
+  const ACallback: TAMQPConsumerCallback; ANoAck, AExclusive: Boolean): string;
+var
+  LTag: string;
+  LConsume: TAMQPBasicConsume;
+begin
+  // Geramos o consumer-tag no cliente e registramos o callback ANTES de enviar,
+  // para não perder deliveries que cheguem entre o Consume-Ok e o registro.
+  LTag := Format('ctag-%d-%d', [FChannelId, TInterlocked.Increment(FConsumerCounter)]);
+  FConsumersLock.Enter;
+  try
+    FConsumers.AddOrSetValue(LTag, ACallback);
+  finally
+    FConsumersLock.Leave;
+  end;
+
+  try
+    LConsume := TAMQPBasicConsume.Create(AQueue, LTag, ANoAck);
+    LConsume.Exclusive := AExclusive;
+    CallRpc(BuildBasicConsume(LConsume)); // Consume-Ok (devolve o mesmo tag)
+  except
+    FConsumersLock.Enter;
+    try
+      FConsumers.Remove(LTag);
+    finally
+      FConsumersLock.Leave;
+    end;
+    raise;
+  end;
+  Result := LTag;
+end;
+
+procedure TAMQPChannel.Cancel(const AConsumerTag: string);
+begin
+  CallRpc(BuildBasicCancel(AConsumerTag, False)); // Cancel-Ok
+  FConsumersLock.Enter;
+  try
+    FConsumers.Remove(AConsumerTag);
+  finally
+    FConsumersLock.Leave;
+  end;
+end;
+
+procedure TAMQPChannel.DispatchDelivery(const ADeliver: TAMQPBasicDeliver;
+  const AProps: TAMQPBasicProperties; const ABody: TBytes);
+var
+  LCallback: TAMQPConsumerCallback;
+  LDelivery: TAMQPDelivery;
+begin
+  FConsumersLock.Enter;
+  try
+    if not FConsumers.TryGetValue(ADeliver.ConsumerTag, LCallback) then
+      LCallback := nil;
+  finally
+    FConsumersLock.Leave;
+  end;
+
+  LDelivery := Default(TAMQPDelivery);
+  LDelivery.ConsumerTag := ADeliver.ConsumerTag;
+  LDelivery.DeliveryTag := ADeliver.DeliveryTag;
+  LDelivery.Redelivered := ADeliver.Redelivered;
+  LDelivery.Exchange := ADeliver.Exchange;
+  LDelivery.RoutingKey := ADeliver.RoutingKey;
+  LDelivery.Properties := AProps;
+  LDelivery.Body := ABody;
+
+  if not Assigned(LCallback) then
+  begin
+    // sem consumer (cancelado): libera eventuais Headers e descarta
+    if LDelivery.Properties.Has(bpHeaders) and Assigned(LDelivery.Properties.Headers) then
+      LDelivery.Properties.Headers.Free;
+    Exit;
+  end;
+
+  // Despacha para o pool nativo; a thread de leitura NÃO roda o callback.
+  TInterlocked.Increment(FInFlight);
+  TTask.Run(
+    procedure
+    begin
+      try
+        LCallback(Self, LDelivery);
+      finally
+        if LDelivery.Properties.Has(bpHeaders) and Assigned(LDelivery.Properties.Headers) then
+          LDelivery.Properties.Headers.Free;
+        TInterlocked.Decrement(FInFlight);
+      end;
+    end);
+end;
+
+procedure TAMQPChannel.DrainInFlight;
+var
+  LWaited: Integer;
+begin
+  LWaited := 0;
+  while (TInterlocked.CompareExchange(FInFlight, 0, 0) > 0) and
+        (LWaited < AMQP_DRAIN_TIMEOUT_MS) do
+  begin
+    TThread.Sleep(10);
+    Inc(LWaited, 10);
+  end;
+end;
+
 procedure TAMQPChannel.Close(AReplyCode: Word; const AReplyText: string);
 var
   LClose: TAMQPCloseInfo;
@@ -865,6 +1027,9 @@ begin
   end;
   FClosed := True;
   FIsOpen := False;
+  // Após o Close-Ok o servidor não entrega mais; espera callbacks em voo
+  // terminarem antes de o objeto poder ser liberado.
+  DrainInFlight;
   FConnection.UnregisterChannel(FChannelId);
 end;
 
@@ -887,8 +1052,10 @@ begin
     LMsg.Properties := FAsmProps;
     LMsg.Body := FAsmBody;
     SignalMessage(LMsg);
-  end;
-  // Basic.Deliver / Basic.Return: tratados no item 3b / futuro.
+  end
+  else if FAsmMethodId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_DELIVER) then
+    DispatchDelivery(FAsmDeliver, FAsmProps, FAsmBody);
+  // Basic.Return: descartado por ora (mensagem não roteável em publish mandatory).
   FAsmBody := nil;
 end;
 
@@ -898,6 +1065,7 @@ var
   LId: TAMQPMethodId;
   LClose: TAMQPCloseInfo;
   LHeader: TAMQPContentHeader;
+  LTag: string;
 begin
   case FAsmState of
     asHeader:
@@ -949,13 +1117,28 @@ begin
       FAsmGetOk := DecodeBasicGetOk(LReader);
       FAsmState := asHeader;
     end
-    else if LId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_DELIVER) or
-            LId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_RETURN) then
+    else if LId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_DELIVER) then
     begin
-      // conteúdo que ainda não consumimos (item 3b): guarda o método e drena o
-      // content header/body para não dessincronizar o stream.
+      FAsmMethodId := LId;
+      FAsmDeliver := DecodeBasicDeliver(LReader);
+      FAsmState := asHeader; // conteúdo vem nos próximos frames
+    end
+    else if LId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_RETURN) then
+    begin
+      // publish mandatory não roteado: guarda e drena o conteúdo (descartado).
       FAsmMethodId := LId;
       FAsmState := asHeader;
+    end
+    else if LId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_CANCEL) then
+    begin
+      // servidor cancelou o consumer (ex.: fila removida).
+      LTag := DecodeBasicCancel(LReader);
+      FConsumersLock.Enter;
+      try
+        FConsumers.Remove(LTag);
+      finally
+        FConsumersLock.Leave;
+      end;
     end
     else if LId.Matches(AMQP_CLASS_CHANNEL, AMQP_CHANNEL_CLOSE) then
     begin

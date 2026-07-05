@@ -80,6 +80,28 @@ type
     MessageCount: Cardinal;
   end;
 
+  { Argumentos de Basic.Consume. }
+  TAMQPBasicConsume = record
+    Queue: string;
+    ConsumerTag: string;    // '' => o servidor gera
+    NoLocal: Boolean;
+    NoAck: Boolean;         // True = sem ack (auto); False = ack manual
+    Exclusive: Boolean;
+    NoWait: Boolean;
+    Arguments: TAMQPFieldTable; // pode ser nil
+    class function Create(const AQueue, AConsumerTag: string;
+      ANoAck: Boolean = False): TAMQPBasicConsume; static;
+  end;
+
+  { Argumentos de Basic.Deliver (a mensagem vem no content header + body). }
+  TAMQPBasicDeliver = record
+    ConsumerTag: string;
+    DeliveryTag: UInt64;
+    Redelivered: Boolean;
+    Exchange: string;
+    RoutingKey: string;
+  end;
+
 function BuildBasicPublish(const AExchange, ARoutingKey: string;
   AMandatory: Boolean = False; AImmediate: Boolean = False): TBytes;
 
@@ -89,6 +111,18 @@ function DecodeBasicGetOk(const AReader: TAMQPReader): TAMQPBasicGetOk;
 function BuildBasicAck(ADeliveryTag: UInt64; AMultiple: Boolean = False): TBytes;
 function BuildBasicNack(ADeliveryTag: UInt64; AMultiple: Boolean = False;
   ARequeue: Boolean = True): TBytes;
+
+function BuildBasicQos(APrefetchCount: Word; AGlobal: Boolean = False;
+  APrefetchSize: Cardinal = 0): TBytes;
+
+function BuildBasicConsume(const AConsume: TAMQPBasicConsume): TBytes;
+function DecodeBasicConsumeOk(const AReader: TAMQPReader): string; // consumer-tag
+
+function BuildBasicCancel(const AConsumerTag: string; ANoWait: Boolean = False): TBytes;
+function DecodeBasicCancelOk(const AReader: TAMQPReader): string;  // consumer-tag
+function DecodeBasicCancel(const AReader: TAMQPReader): string;    // servidor -> cliente
+
+function DecodeBasicDeliver(const AReader: TAMQPReader): TAMQPBasicDeliver;
 
 /// Payload do frame de content header (tipo 2). ABodySize = total do corpo.
 function BuildContentHeader(ABodySize: UInt64;
@@ -278,6 +312,91 @@ begin
   finally
     W.Free;
   end;
+end;
+
+function BuildBasicQos(APrefetchCount: Word; AGlobal: Boolean;
+  APrefetchSize: Cardinal): TBytes;
+var
+  W: TAMQPWriter;
+begin
+  W := BeginMethod(AMQP_CLASS_BASIC, AMQP_BASIC_QOS);
+  try
+    W.WriteLongUInt(APrefetchSize);
+    W.WriteShortUInt(APrefetchCount);
+    W.WriteBit(AGlobal);
+    Result := W.ToBytes;
+  finally
+    W.Free;
+  end;
+end;
+
+{ TAMQPBasicConsume }
+
+class function TAMQPBasicConsume.Create(const AQueue, AConsumerTag: string;
+  ANoAck: Boolean): TAMQPBasicConsume;
+begin
+  Result := Default(TAMQPBasicConsume);
+  Result.Queue := AQueue;
+  Result.ConsumerTag := AConsumerTag;
+  Result.NoAck := ANoAck;
+end;
+
+function BuildBasicConsume(const AConsume: TAMQPBasicConsume): TBytes;
+var
+  W: TAMQPWriter;
+begin
+  W := BeginMethod(AMQP_CLASS_BASIC, AMQP_BASIC_CONSUME);
+  try
+    W.WriteShortUInt(0); // reserved-1 (ticket)
+    W.WriteShortStr(AConsume.Queue);
+    W.WriteShortStr(AConsume.ConsumerTag);
+    W.WriteBit(AConsume.NoLocal);
+    W.WriteBit(AConsume.NoAck);
+    W.WriteBit(AConsume.Exclusive);
+    W.WriteBit(AConsume.NoWait);
+    W.WriteFieldTable(AConsume.Arguments);
+    Result := W.ToBytes;
+  finally
+    W.Free;
+  end;
+end;
+
+function DecodeBasicConsumeOk(const AReader: TAMQPReader): string;
+begin
+  Result := AReader.ReadShortStr; // consumer-tag
+end;
+
+function BuildBasicCancel(const AConsumerTag: string; ANoWait: Boolean): TBytes;
+var
+  W: TAMQPWriter;
+begin
+  W := BeginMethod(AMQP_CLASS_BASIC, AMQP_BASIC_CANCEL);
+  try
+    W.WriteShortStr(AConsumerTag);
+    W.WriteBit(ANoWait);
+    Result := W.ToBytes;
+  finally
+    W.Free;
+  end;
+end;
+
+function DecodeBasicCancelOk(const AReader: TAMQPReader): string;
+begin
+  Result := AReader.ReadShortStr;
+end;
+
+function DecodeBasicCancel(const AReader: TAMQPReader): string;
+begin
+  Result := AReader.ReadShortStr; // consumer-tag (o no-wait bit que segue é ignorado)
+end;
+
+function DecodeBasicDeliver(const AReader: TAMQPReader): TAMQPBasicDeliver;
+begin
+  Result.ConsumerTag := AReader.ReadShortStr;
+  Result.DeliveryTag := AReader.ReadLongLongUInt;
+  Result.Redelivered := AReader.ReadBit;
+  Result.Exchange := AReader.ReadShortStr;
+  Result.RoutingKey := AReader.ReadShortStr;
 end;
 
 { Content header }

@@ -32,6 +32,10 @@ type
     [Test] procedure BasicGetOk_Decode;
     [Test] procedure BasicAck_RoundTrip;
     [Test] procedure BasicNack_RoundTrip;
+    [Test] procedure BasicQos_RoundTrip;
+    [Test] procedure BasicConsume_RoundTrip;
+    [Test] procedure BasicConsumeOk_Decode;
+    [Test] procedure BasicDeliver_Decode;
   end;
 
   [TestFixture]
@@ -293,6 +297,104 @@ begin
     Assert.IsTrue(R.ReadBit, 'requeue');
   finally
     R.Free;
+  end;
+end;
+
+procedure TChannelQueueExchangeTests.BasicQos_RoundTrip;
+var
+  R: TAMQPReader;
+  LId: TAMQPMethodId;
+begin
+  R := TAMQPReader.Create(BuildBasicQos(10, False));
+  try
+    LId := ReadMethodHeader(R);
+    Assert.IsTrue(LId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_QOS));
+    Assert.AreEqual(Cardinal(0), R.ReadLongUInt, 'prefetch-size');
+    Assert.AreEqual(Word(10), R.ReadShortUInt, 'prefetch-count');
+    Assert.IsFalse(R.ReadBit, 'global');
+  finally
+    R.Free;
+  end;
+end;
+
+procedure TChannelQueueExchangeTests.BasicConsume_RoundTrip;
+var
+  LConsume: TAMQPBasicConsume;
+  R: TAMQPReader;
+  LId: TAMQPMethodId;
+begin
+  LConsume := TAMQPBasicConsume.Create('nfe.respostas', 'ctag-1', False);
+  LConsume.Exclusive := True;
+
+  R := TAMQPReader.Create(BuildBasicConsume(LConsume));
+  try
+    LId := ReadMethodHeader(R);
+    Assert.IsTrue(LId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_CONSUME));
+    Assert.AreEqual(Word(0), R.ReadShortUInt, 'reserved-1');
+    Assert.AreEqual('nfe.respostas', R.ReadShortStr, 'queue');
+    Assert.AreEqual('ctag-1', R.ReadShortStr, 'consumer-tag');
+    Assert.IsFalse(R.ReadBit, 'no-local');
+    Assert.IsFalse(R.ReadBit, 'no-ack');
+    Assert.IsTrue(R.ReadBit, 'exclusive');
+    Assert.IsFalse(R.ReadBit, 'no-wait');
+  finally
+    R.Free;
+  end;
+end;
+
+procedure TChannelQueueExchangeTests.BasicConsumeOk_Decode;
+var
+  W: TAMQPWriter;
+  R: TAMQPReader;
+  LId: TAMQPMethodId;
+begin
+  W := TAMQPWriter.Create;
+  try
+    WriteMethodHeader(W, AMQP_CLASS_BASIC, AMQP_BASIC_CONSUME_OK);
+    W.WriteShortStr('ctag-gerada');
+    R := TAMQPReader.Create(W.ToBytes);
+    try
+      LId := ReadMethodHeader(R);
+      Assert.IsTrue(LId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_CONSUME_OK));
+      Assert.AreEqual('ctag-gerada', DecodeBasicConsumeOk(R));
+    finally
+      R.Free;
+    end;
+  finally
+    W.Free;
+  end;
+end;
+
+procedure TChannelQueueExchangeTests.BasicDeliver_Decode;
+var
+  W: TAMQPWriter;
+  R: TAMQPReader;
+  LId: TAMQPMethodId;
+  LDeliver: TAMQPBasicDeliver;
+begin
+  W := TAMQPWriter.Create;
+  try
+    WriteMethodHeader(W, AMQP_CLASS_BASIC, AMQP_BASIC_DELIVER);
+    W.WriteShortStr('ctag-1');    // consumer-tag
+    W.WriteLongLongUInt(99);      // delivery-tag
+    W.WriteBit(False);            // redelivered
+    W.WriteShortStr('nfe.ex');    // exchange
+    W.WriteShortStr('resp.rk');   // routing-key
+    R := TAMQPReader.Create(W.ToBytes);
+    try
+      LId := ReadMethodHeader(R);
+      Assert.IsTrue(LId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_DELIVER));
+      LDeliver := DecodeBasicDeliver(R);
+      Assert.AreEqual('ctag-1', LDeliver.ConsumerTag);
+      Assert.IsTrue(UInt64(99) = LDeliver.DeliveryTag, 'delivery-tag');
+      Assert.IsFalse(LDeliver.Redelivered);
+      Assert.AreEqual('nfe.ex', LDeliver.Exchange);
+      Assert.AreEqual('resp.rk', LDeliver.RoutingKey);
+    finally
+      R.Free;
+    end;
+  finally
+    W.Free;
   end;
 end;
 

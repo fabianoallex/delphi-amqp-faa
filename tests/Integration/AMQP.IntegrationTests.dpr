@@ -19,7 +19,8 @@ uses
   AMQP.Basic.Methods in '..\..\src\AMQP.Basic.Methods.pas',
   AMQP.Connection in '..\..\src\AMQP.Connection.pas',
   AMQP.HandshakeIntegrationTests in 'AMQP.HandshakeIntegrationTests.pas',
-  AMQP.ChannelIntegrationTests in 'AMQP.ChannelIntegrationTests.pas';
+  AMQP.ChannelIntegrationTests in 'AMQP.ChannelIntegrationTests.pas',
+  AMQP.ConsumeIntegrationTests in 'AMQP.ConsumeIntegrationTests.pas';
 
 var
   runner: ITestRunner;
