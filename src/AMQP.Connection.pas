@@ -200,6 +200,18 @@ type
     constructor Create(AConnection: TAMQPConnection);
   end;
 
+  { Thread de heartbeat: acorda periodicamente (espera interrompível via TEvent,
+    NÃO TTimer) para enviar heartbeat quando o envio está ocioso e para detectar
+    conexão morta (nenhum frame recebido em 2x o intervalo negociado). }
+  TAMQPHeartbeatThread = class(TThread)
+  private
+    FConnection: TAMQPConnection;
+  protected
+    procedure Execute; override;
+  public
+    constructor Create(AConnection: TAMQPConnection);
+  end;
+
   TAMQPConnection = class
   private
     FParams: TAMQPConnectionParams;
@@ -213,6 +225,11 @@ type
     FChannels: TDictionary<Word, TAMQPChannel>;
     FReadThread: TAMQPReaderThread;
     FCloseOkEvent: TEvent;
+    // --- heartbeat ---
+    FHeartbeatThread: TAMQPHeartbeatThread;
+    FHbStopEvent: TEvent;
+    FLastWriteTick: UInt64; // atualizado a cada frame enviado
+    FLastReadTick: UInt64;  // atualizado a cada frame recebido
     // --- envio (serializado por FWriteLock) ---
     procedure SendFrameNoLock(AFrameType: Byte; AChannel: Word; const APayload: TBytes);
     procedure SendFrame(AFrameType: Byte; AChannel: Word; const APayload: TBytes);
@@ -222,9 +239,12 @@ type
     function NextMethodOn(AExpectChannel: Word; out AId: TAMQPMethodId): TAMQPReader;
     function ExpectMethod(AExpectChannel, AClassId, AMethodId: Word): TAMQPReader;
     procedure Handshake;
-    // --- thread de leitura ---
+    // --- threads ---
     procedure StartReadThread;
     procedure StopReadThread;
+    procedure StartHeartbeatThread;
+    procedure StopHeartbeatThread;
+    procedure HeartbeatTick;
     procedure DispatchFrame(const AFrame: TAMQPFrame);
     procedure HandleConnectionFrame(const AFrame: TAMQPFrame);
     procedure ReadThreadFinished(const AError: string);
@@ -322,6 +342,7 @@ begin
     while not Terminated do
     begin
       LFrame := TAMQPFrame.ReadFrom(FConnection.FStream);
+      FConnection.FLastReadTick := TThread.GetTickCount64;
       FConnection.DispatchFrame(LFrame);
     end;
     FConnection.ReadThreadFinished('');
@@ -329,6 +350,34 @@ begin
     on E: Exception do
       // fim de stream (socket fechado) ou erro de protocolo: encerra a thread.
       FConnection.ReadThreadFinished(E.Message);
+  end;
+end;
+
+{ TAMQPHeartbeatThread }
+
+constructor TAMQPHeartbeatThread.Create(AConnection: TAMQPConnection);
+begin
+  FConnection := AConnection;
+  FreeOnTerminate := False;
+  inherited Create(False);
+end;
+
+procedure TAMQPHeartbeatThread.Execute;
+var
+  LWaitMs: Cardinal;
+begin
+  // Acorda a cada metade do intervalo (mínimo 1s); a espera é interrompível
+  // via FHbStopEvent (não usamos TTimer).
+  LWaitMs := (Cardinal(FConnection.FNegotiated.Heartbeat) * 1000) div 2;
+  if LWaitMs < 1000 then
+    LWaitMs := 1000;
+  while not Terminated do
+  begin
+    if FConnection.FHbStopEvent.WaitFor(LWaitMs) = wrSignaled then
+      Break; // parada solicitada
+    if Terminated then
+      Break;
+    FConnection.HeartbeatTick;
   end;
 end;
 
@@ -342,6 +391,7 @@ begin
   FChannelsLock := TCriticalSection.Create;
   FChannels := TDictionary<Word, TAMQPChannel>.Create;
   FCloseOkEvent := TEvent.Create(nil, True, False, '');
+  FHbStopEvent := TEvent.Create(nil, True, False, '');
 end;
 
 destructor TAMQPConnection.Destroy;
@@ -353,6 +403,7 @@ begin
       Close;
     except
     end;
+  StopHeartbeatThread;
   StopReadThread;
   FStream.Free;
   if Assigned(FSocket) then
@@ -374,6 +425,7 @@ begin
   FChannelsLock.Free;
   FWriteLock.Free;
   FCloseOkEvent.Free;
+  FHbStopEvent.Free;
   inherited;
 end;
 
@@ -385,6 +437,7 @@ begin
   // Assume FWriteLock já adquirido (envio de grupo de frames, ex.: Publish).
   LFrame := TAMQPFrame.Create(AFrameType, AChannel, APayload);
   LFrame.WriteTo(FStream);
+  FLastWriteTick := TThread.GetTickCount64;
 end;
 
 procedure TAMQPConnection.SendFrame(AFrameType: Byte; AChannel: Word;
@@ -522,7 +575,10 @@ begin
 
   Handshake;           // síncrono, antes da thread
   FIsOpen := True;
+  FLastWriteTick := TThread.GetTickCount64;
+  FLastReadTick := FLastWriteTick;
   StartReadThread;     // a partir daqui, só a thread lê o socket
+  StartHeartbeatThread;
 end;
 
 { --- Thread de leitura --- }
@@ -545,6 +601,58 @@ begin
     FReadThread.WaitFor;
     FreeAndNil(FReadThread);
   end;
+end;
+
+{ --- Thread de heartbeat --- }
+
+procedure TAMQPConnection.StartHeartbeatThread;
+begin
+  if FNegotiated.Heartbeat = 0 then
+    Exit; // heartbeat desabilitado na negociação
+  FHbStopEvent.ResetEvent;
+  FHeartbeatThread := TAMQPHeartbeatThread.Create(Self);
+end;
+
+procedure TAMQPConnection.StopHeartbeatThread;
+begin
+  if Assigned(FHeartbeatThread) then
+  begin
+    FHeartbeatThread.Terminate;
+    FHbStopEvent.SetEvent; // interrompe a espera imediatamente
+    FHeartbeatThread.WaitFor;
+    FreeAndNil(FHeartbeatThread);
+  end;
+end;
+
+procedure TAMQPConnection.HeartbeatTick;
+var
+  LIntervalMs: UInt64;
+  LNow: UInt64;
+begin
+  LIntervalMs := UInt64(FNegotiated.Heartbeat) * 1000;
+  if LIntervalMs = 0 then
+    Exit;
+  LNow := TThread.GetTickCount64;
+
+  // Conexão morta: nenhum frame recebido em 2x o intervalo (o servidor também
+  // manda heartbeats). Fecha o socket para desbloquear a thread de leitura.
+  if (LNow - FLastReadTick) > (2 * LIntervalMs) then
+  begin
+    if Assigned(FSocket) then
+      try
+        FSocket.Close;
+      except
+      end;
+    Exit;
+  end;
+
+  // Envio ocioso há >= metade do intervalo: manda um heartbeat.
+  if (LNow - FLastWriteTick) >= (LIntervalMs div 2) then
+    try
+      SendFrame(AMQP_FRAME_HEARTBEAT, AMQP_CHANNEL_CONNECTION, nil);
+    except
+      // erro de escrita: a thread de leitura vai perceber o socket caído
+    end;
 end;
 
 procedure TAMQPConnection.ReadThreadFinished(const AError: string);
@@ -663,6 +771,8 @@ begin
   if not FIsOpen then
     Exit;
   FIsOpen := False;
+
+  StopHeartbeatThread; // não enviar heartbeats durante o fechamento
 
   LClose.ReplyCode := AReplyCode;
   LClose.ReplyText := AReplyText;

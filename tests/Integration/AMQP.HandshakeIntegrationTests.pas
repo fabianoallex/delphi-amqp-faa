@@ -9,8 +9,10 @@ interface
 uses
   DUnitX.TestFramework,
   System.SysUtils,
+  System.Classes,
   AMQP.Connection,
-  AMQP.Connection.Methods;
+  AMQP.Connection.Methods,
+  AMQP.Queue.Methods;
 
 type
   [TestFixture]
@@ -20,6 +22,7 @@ type
     [Test] procedure TuneNegociado_TemLimitesRazoaveis;
     [Test] procedure CredenciaisInvalidas_Levanta;
     [Test] procedure VirtualHostInexistente_Levanta;
+    [Test] procedure Heartbeat_MantemConexaoViva;
   end;
 
 implementation
@@ -104,6 +107,43 @@ begin
       end;
     end,
     EAMQPConnection);
+end;
+
+procedure TAMQPHandshakeIntegrationTests.Heartbeat_MantemConexaoViva;
+var
+  LParams: TAMQPConnectionParams;
+  LConn: TAMQPConnection;
+  LChan: TAMQPChannel;
+  LDecl: TAMQPQueueDeclare;
+begin
+  LParams := TAMQPConnectionParams.Localhost;
+  LParams.Heartbeat := 2; // negocia 2s; cliente manda heartbeat a cada 1s
+  LConn := TAMQPConnection.Create(LParams);
+  try
+    LConn.Open;
+    Assert.IsTrue(LConn.NegotiatedTune.Heartbeat > 0, 'heartbeat deveria ser > 0');
+    Assert.IsTrue(LConn.NegotiatedTune.Heartbeat <= 2, 'heartbeat negociado <= 2s');
+
+    // Fica ocioso por mais que 2x o intervalo. Sem heartbeat, o broker
+    // derrubaria a conexão; com heartbeat, ela continua viva.
+    TThread.Sleep(5000);
+
+    Assert.IsTrue(LConn.IsOpen, 'conexão deveria continuar aberta após ociosidade');
+
+    // E continua utilizável:
+    LChan := LConn.CreateChannel;
+    try
+      LDecl := Default(TAMQPQueueDeclare);
+      LDecl.Exclusive := True;
+      LDecl.AutoDelete := True;
+      Assert.IsTrue(LChan.DeclareQueue(LDecl).QueueName <> '',
+        'canal deveria funcionar após o período ocioso');
+    finally
+      LChan.Free;
+    end;
+  finally
+    LConn.Free;
+  end;
 end;
 
 initialization
