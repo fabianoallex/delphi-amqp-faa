@@ -298,11 +298,11 @@ Abra `AMQP.groupproj` no RAD Studio.
   (`ConfirmSelect`) e cobrem a garantia "meu publish chegou?". Se surgir
   necessidade real de lote atômico, o subconjunto tratável é
   `Tx.Select/Commit/Rollback` para uso serial em canal dedicado.
-- Publisher confirms + reconexão: ao reconectar, o canal reinicia a numeração de
-  seq-no e o modo confirm é re-armado, mas publishes não confirmados antes da
-  queda ficam em estado ambíguo — são reportados como **não confirmados**
-  (`WaitForConfirm` retorna `False`), não reenviados automaticamente. Reenvie na
-  sua camada se precisar de garantia ponta a ponta.
+- Publisher confirms + reconexão: ao reconectar, o modo confirm é re-armado e os
+  seq-nos devolvidos por `Publish` seguem **monotônicos** (não reiniciam). Os
+  publishes não confirmados antes da queda são reportados como **não confirmados**
+  (`WaitForConfirm`/`WaitForConfirms` retornam `False`), porém **não reenviados
+  automaticamente** — reenvie na sua camada se precisar de garantia ponta a ponta.
 - A recuperação de topologia na reconexão assume filas **nomeadas**; filas com
   nome gerado pelo servidor recebem um novo nome ao serem redeclaradas.
 - TLS é **só Windows** (SChannel). mTLS/client-cert, escolha manual de versão/

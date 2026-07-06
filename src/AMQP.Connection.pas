@@ -198,11 +198,12 @@ type
     FInFlight: Integer; // callbacks em execução no pool (atômico)
     // --- publisher confirms ---
     // FConfirmMon é lock + variável de condição (System.TMonitor) que protege
-    // FUnconfirmed/FNacked/FPublishSeqNo e acorda WaitForConfirm(s).
+    // FUnconfirmed/FNacked/FPublishSeqNo/FConfirmBase e acorda WaitForConfirm(s).
     // Ordem de locks: é o lock MAIS interno — só se adquire sozinho ou dentro do
     // FWriteLock (Publish); nunca se adquire outro lock segurando-o.
     FConfirmMode: Boolean;
-    FPublishSeqNo: UInt64;                  // último seq-no atribuído (1º publish = 1)
+    FPublishSeqNo: UInt64;   // seq-no do usuário, monotônico (NÃO reseta na reconexão)
+    FConfirmBase: UInt64;    // offset da sessão: userSeqNo = FConfirmBase + wireTag do broker
     FConfirmMon: TObject;
     FUnconfirmed: TDictionary<UInt64, Boolean>; // seq-nos aguardando confirmação
     FNacked: TDictionary<UInt64, Boolean>;      // seq-nos nack-ados (ou perdidos na queda)
@@ -1208,14 +1209,16 @@ begin
   try
     FClosed := False;
     FAsmState := asIdle;
-    // Sessão nova: seq-no reinicia em 0 (o confirm.select é replayado abaixo, e
-    // o broker também reinicia a numeração). Publishes não confirmados antes da
-    // queda já foram reportados como não confirmados por FailAllUnconfirmed.
+    // Sessão nova: o broker reinicia a numeração do WIRE em 1. Mantemos o seq-no
+    // do USUÁRIO (FPublishSeqNo) monotônico e guardamos o offset da sessão para
+    // converter os tags do broker (ver ResolveConfirms) — os novos publishes
+    // recebem números ACIMA dos antigos, sem colisão. FNacked NÃO é limpo: os
+    // publishes perdidos na queda seguem reportáveis como não confirmados
+    // (FailAllUnconfirmed já os moveu de FUnconfirmed para FNacked).
     System.TMonitor.Enter(FConfirmMon);
     try
-      FPublishSeqNo := 0;
+      FConfirmBase := FPublishSeqNo;
       FUnconfirmed.Clear;
-      FNacked.Clear;
       System.TMonitor.PulseAll(FConfirmMon);
     finally
       System.TMonitor.Exit(FConfirmMon);
@@ -1487,6 +1490,7 @@ begin
     FUnconfirmed.Clear;
     FNacked.Clear;
     FPublishSeqNo := 0; // primeiro publish daqui em diante recebe o seq-no 1
+    FConfirmBase := 0;
   finally
     System.TMonitor.Exit(FConfirmMon);
   end;
@@ -1728,16 +1732,19 @@ function TAMQPChannel.ResolveConfirms(ATag: UInt64;
   AMultiple, AAck: Boolean): TArray<UInt64>;
 var
   LList: TList<UInt64>;
-  LKey: UInt64;
+  LKey, LUserTag: UInt64;
 begin
-  // Roda na thread de leitura. `multiple` cobre "este e todos os anteriores
-  // ainda pendentes", então resolvemos todo seq-no <= tag.
+  // Roda na thread de leitura. ATag é o delivery-tag do broker (numeração do
+  // WIRE, reinicia por sessão); somamos o offset da sessão para chegar ao seq-no
+  // do usuário. `multiple` cobre "este e todos os anteriores ainda pendentes",
+  // então resolvemos todo seq-no <= tag.
   LList := TList<UInt64>.Create;
   try
     System.TMonitor.Enter(FConfirmMon);
     try
+      LUserTag := FConfirmBase + ATag;
       for LKey in FUnconfirmed.Keys do
-        if (AMultiple and (LKey <= ATag)) or (LKey = ATag) then
+        if (AMultiple and (LKey <= LUserTag)) or (LKey = LUserTag) then
           LList.Add(LKey);
       for LKey in LList do
       begin

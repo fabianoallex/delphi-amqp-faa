@@ -35,6 +35,7 @@ type
     [TearDown] procedure TearDown;
 
     [Test] procedure Reconecta_E_ContinuaConsumindo;
+    [Test] procedure Confirm_PerdaNaQueda_WaitForConfirmsRetornaFalse;
   end;
 
 implementation
@@ -151,6 +152,57 @@ begin
   WaitReceived('depois-da-recuperacao', 5000);
   Assert.IsTrue(ReceivedContains('depois-da-recuperacao'),
     'deveria voltar a consumir após a reconexão');
+end;
+
+procedure TAMQPReconnectIntegrationTests.Confirm_PerdaNaQueda_WaitForConfirmsRetornaFalse;
+var
+  LParams: TAMQPConnectionParams;
+  LConn: TAMQPConnection;
+  LChan: TAMQPChannel;
+  LReconnected: Integer;
+  I, LWaited: Integer;
+begin
+  // Conexão própria (isolada das fixtures do Setup) com auto-reconexão.
+  LReconnected := 0;
+  LParams := TAMQPConnectionParams.Localhost;
+  LParams.AutoReconnect := True;
+  LParams.ReconnectDelayMs := 500;
+  LConn := TAMQPConnection.Create(LParams);
+  try
+    LConn.OnReconnect :=
+      procedure(AConnection: TAMQPConnection)
+      begin
+        TInterlocked.Exchange(LReconnected, 1);
+      end;
+    LConn.Open;
+    LChan := LConn.CreateChannel;
+    LChan.ConfirmSelect;
+
+    // Publica um lote e derruba IMEDIATAMENTE, antes de os acks chegarem: os
+    // publishes ficam pendentes e a queda os marca como não confirmados
+    // (FailAllUnconfirmed -> FNacked).
+    for I := 1 to 200 do
+      LChan.PublishText('', 'confirm-drop-test', 'x');
+    LConn.DropConnectionForTest;
+
+    // Aguarda a auto-reconexão + recuperação (re-arma o confirm mode).
+    LWaited := 0;
+    while (TInterlocked.CompareExchange(LReconnected, 0, 0) = 0) and
+          (LWaited < 15000) do
+    begin
+      TThread.Sleep(50);
+      Inc(LWaited, 50);
+    end;
+    Assert.AreEqual(1, TInterlocked.CompareExchange(LReconnected, 0, 0),
+      'deveria ter reconectado');
+
+    // Os publishes pendentes na queda foram PERDIDOS: WaitForConfirms deve
+    // reportar False. (Bug: Recover limpava FNacked e isto retornava True.)
+    Assert.IsFalse(LChan.WaitForConfirms(3000),
+      'WaitForConfirms deve reportar False para publishes perdidos na queda');
+  finally
+    LConn.Free;
+  end;
 end;
 
 initialization
