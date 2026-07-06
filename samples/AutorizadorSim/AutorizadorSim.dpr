@@ -1,4 +1,4 @@
-program AutorizadorSim;
+﻿program AutorizadorSim;
 
 { Simula o autorizador publicando N retornos de nota quase ao mesmo tempo,
   como se vários PDVs tivessem emitido notas em sequência. Companheiro do
@@ -15,7 +15,7 @@ uses
 
 const
   QUEUE_NAME = 'sefaz-respostas';
-  QTD_NOTAS = 5;
+  QTD_NOTAS = 6;
 
 procedure Main;
 var

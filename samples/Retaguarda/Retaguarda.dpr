@@ -86,7 +86,7 @@ begin
       LChannel := LConn.CreateChannel;
       try
         LChannel.DeclareQueue(TAMQPQueueDeclare.Create(QUEUE_NAME, True));
-        LChannel.Qos(20); // prefetch: limita mensagens nao confirmadas em voo
+        LChannel.Qos(2); // prefetch: limita mensagens nao confirmadas em voo
 
         // ANoAck=False (padrao do Consume): so confirmamos apos processar -
         // garantia "pelo menos uma vez" de fabrica, sem passo extra.
