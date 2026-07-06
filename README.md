@@ -341,6 +341,31 @@ Mapeamento de ack: o adapter confirma (`Ack`) após `IMessageHandler.Handle`
 retornar sem erro, e devolve à fila (`Nack` com requeue) se o handler
 levantar exceção — at-least-once por padrão, com prefetch 20.
 
+**TLS**: como `TMessagingConfig` é agnóstico (não tem campos de TLS), o adapter
+liga o TLS por convenção de porta — `Port = 5671` (amqps) ativa `UseTls` com
+validação de certificado (`TlsVerifyPeer=True`). Cert self-signed/dev ou
+`verify-off` exigem estender a config no infra.
+
+**Escape hatch** (recursos que não cabem no contrato genérico — publisher
+confirms, `Connection.Blocked/Unblocked`, `Queue.Unbind`): o consumer e o
+publisher também expõem `IDelphiAmqpFaaNative`, obtido via `Supports`, para
+descer ao objeto nativo desta lib de forma explícita e opcional:
+
+```pascal
+var LNative: IDelphiAmqpFaaNative;
+if Supports(LPublisher, IDelphiAmqpFaaNative, LNative) then
+begin
+  LNative.NativeChannel.ConfirmSelect;
+  LNative.NativeConnection.OnBlocked :=
+    procedure(AConn: TAMQPConnection; const AReason: string)
+    begin { pausa o publish enquanto o broker está em resource alarm } end;
+end;
+```
+
+Os objetos nativos são propriedade do adapter (não liberar); no consumer só
+ficam válidos após `Start`. Em confirm mode, publique pelo `NativeChannel` para
+receber o seq-no (o `Publish` genérico da interface o descarta).
+
 ## Roadmap
 
 Itens 1–4 concluídos (framing/handshake, canais + publish/get, consumo

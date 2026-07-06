@@ -35,6 +35,23 @@ uses
   AMQP.Wire;
 
 type
+  { Escape hatch: acesso ao objeto NATIVO desta lib, para recursos que não cabem
+    no contrato genérico de Messaging.Interfaces — publisher confirms,
+    Connection.Blocked/Unblocked, Queue.Unbind, arguments tables etc.
+
+    Obtido por Supports(publisher_ou_consumer, IDelphiAmqpFaaNative, LNative).
+    Os objetos retornados são PROPRIEDADE do adapter — NÃO liberar. Só são
+    válidos enquanto o publisher/consumer viver e estiver conectado; para o
+    consumer, isso é DEPOIS de Start (antes, retornam nil).
+
+    Em confirm mode, publique pelo canal nativo (NativeChannel.Publish/PublishText)
+    para receber o seq-no — o Publish genérico da interface o descarta. }
+  IDelphiAmqpFaaNative = interface
+    ['{7B2E5A44-9C31-4E88-A0F2-1D6C3B9E4F70}']
+    function NativeConnection: TAMQPConnection;
+    function NativeChannel: TAMQPChannel;
+  end;
+
   TDelphiAmqpFaaPayload = class(TInterfacedObject, IMessagePayload)
   private
     FDelivery: TAMQPDelivery;
@@ -45,7 +62,7 @@ type
     function GetHeader(const AKey: string): string;
   end;
 
-  TDelphiAmqpFaaConsumer = class(TInterfacedObject, IMessageConsumer)
+  TDelphiAmqpFaaConsumer = class(TInterfacedObject, IMessageConsumer, IDelphiAmqpFaaNative)
   private
     FParams: TAMQPConnectionParams;
     FConnection: TAMQPConnection;
@@ -62,9 +79,12 @@ type
     procedure Start;
     procedure Stop;
     function IsRunning: Boolean;
+    // IDelphiAmqpFaaNative (nil antes de Start)
+    function NativeConnection: TAMQPConnection;
+    function NativeChannel: TAMQPChannel;
   end;
 
-  TDelphiAmqpFaaPublisher = class(TInterfacedObject, IMessagePublisher)
+  TDelphiAmqpFaaPublisher = class(TInterfacedObject, IMessagePublisher, IDelphiAmqpFaaNative)
   private
     FConnection: TAMQPConnection;
     FChannel: TAMQPChannel;
@@ -72,6 +92,9 @@ type
     constructor Create(const AConfig: TMessagingConfig);
     destructor Destroy; override;
     procedure Publish(const AExchange, ARoutingKey, ABody: string);
+    // IDelphiAmqpFaaNative (disponível já após o constructor)
+    function NativeConnection: TAMQPConnection;
+    function NativeChannel: TAMQPChannel;
   end;
 
   TDelphiAmqpFaaMessagingFactory = class(TInterfacedObject, IMessagingFactory)
@@ -93,6 +116,12 @@ begin
   Result.VirtualHost := AConfig.VHost;
   Result.User := AConfig.User;
   Result.Password := AConfig.Password;
+  // TLS por convenção de porta: 5671 (amqps, IANA) liga o TLS com validação de
+  // cadeia/hostname (TlsVerifyPeer=True, o padrão seguro). TMessagingConfig ainda
+  // não tem campos de TLS (é agnóstico, fica no infra) — cert self-signed/dev,
+  // verify-off ou server-name custom exigem estender a config lá (ver backlog).
+  if Result.Port = 5671 then
+    Result.UseTls := True;
 end;
 
 { TDelphiAmqpFaaPayload }
@@ -231,6 +260,16 @@ begin
   Result := FRunning;
 end;
 
+function TDelphiAmqpFaaConsumer.NativeConnection: TAMQPConnection;
+begin
+  Result := FConnection; // nil antes de Start
+end;
+
+function TDelphiAmqpFaaConsumer.NativeChannel: TAMQPChannel;
+begin
+  Result := FChannel; // nil antes de Start
+end;
+
 { TDelphiAmqpFaaPublisher }
 
 constructor TDelphiAmqpFaaPublisher.Create(const AConfig: TMessagingConfig);
@@ -251,6 +290,16 @@ end;
 procedure TDelphiAmqpFaaPublisher.Publish(const AExchange, ARoutingKey, ABody: string);
 begin
   FChannel.PublishText(AExchange, ARoutingKey, ABody);
+end;
+
+function TDelphiAmqpFaaPublisher.NativeConnection: TAMQPConnection;
+begin
+  Result := FConnection; // pronto já no constructor
+end;
+
+function TDelphiAmqpFaaPublisher.NativeChannel: TAMQPChannel;
+begin
+  Result := FChannel;
 end;
 
 { TDelphiAmqpFaaMessagingFactory }
