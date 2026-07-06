@@ -1,4 +1,4 @@
-<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+﻿<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
     <PropertyGroup>
         <ProjectGuid>{5D0E7C11-9A22-4B3C-8F1D-2E6A4B7C0D33}</ProjectGuid>
     </PropertyGroup>
@@ -9,10 +9,10 @@
         <Projects Include="tests\Integration\AMQP.IntegrationTests.dproj">
             <Dependencies/>
         </Projects>
-        <Projects Include="samples\AutorizadorSim\AutorizadorSim.dproj">
+        <Projects Include="samples\Retaguarda\Retaguarda.dproj">
             <Dependencies/>
         </Projects>
-        <Projects Include="samples\Retaguarda\Retaguarda.dproj">
+        <Projects Include="samples\AutorizadorSim\AutorizadorSim.dproj">
             <Dependencies/>
         </Projects>
     </ItemGroup>
@@ -41,15 +41,6 @@
     <Target Name="AMQP_IntegrationTests:Make">
         <MSBuild Projects="tests\Integration\AMQP.IntegrationTests.dproj" Targets="Make"/>
     </Target>
-    <Target Name="AutorizadorSim">
-        <MSBuild Projects="samples\AutorizadorSim\AutorizadorSim.dproj"/>
-    </Target>
-    <Target Name="AutorizadorSim:Clean">
-        <MSBuild Projects="samples\AutorizadorSim\AutorizadorSim.dproj" Targets="Clean"/>
-    </Target>
-    <Target Name="AutorizadorSim:Make">
-        <MSBuild Projects="samples\AutorizadorSim\AutorizadorSim.dproj" Targets="Make"/>
-    </Target>
     <Target Name="Retaguarda">
         <MSBuild Projects="samples\Retaguarda\Retaguarda.dproj"/>
     </Target>
@@ -59,14 +50,23 @@
     <Target Name="Retaguarda:Make">
         <MSBuild Projects="samples\Retaguarda\Retaguarda.dproj" Targets="Make"/>
     </Target>
+    <Target Name="AutorizadorSim">
+        <MSBuild Projects="samples\AutorizadorSim\AutorizadorSim.dproj"/>
+    </Target>
+    <Target Name="AutorizadorSim:Clean">
+        <MSBuild Projects="samples\AutorizadorSim\AutorizadorSim.dproj" Targets="Clean"/>
+    </Target>
+    <Target Name="AutorizadorSim:Make">
+        <MSBuild Projects="samples\AutorizadorSim\AutorizadorSim.dproj" Targets="Make"/>
+    </Target>
     <Target Name="Build">
-        <CallTarget Targets="AMQP_UnitTests;AMQP_IntegrationTests;AutorizadorSim;Retaguarda"/>
+        <CallTarget Targets="AMQP_UnitTests;AMQP_IntegrationTests;Retaguarda;AutorizadorSim"/>
     </Target>
     <Target Name="Clean">
-        <CallTarget Targets="AMQP_UnitTests:Clean;AMQP_IntegrationTests:Clean;AutorizadorSim:Clean;Retaguarda:Clean"/>
+        <CallTarget Targets="AMQP_UnitTests:Clean;AMQP_IntegrationTests:Clean;Retaguarda:Clean;AutorizadorSim:Clean"/>
     </Target>
     <Target Name="Make">
-        <CallTarget Targets="AMQP_UnitTests:Make;AMQP_IntegrationTests:Make;AutorizadorSim:Make;Retaguarda:Make"/>
+        <CallTarget Targets="AMQP_UnitTests:Make;AMQP_IntegrationTests:Make;Retaguarda:Make;AutorizadorSim:Make"/>
     </Target>
     <Import Project="$(BDS)\Bin\CodeGear.Group.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Group.Targets')"/>
 </Project>
