@@ -44,7 +44,7 @@ Demonstrado em `samples/AutorizadorSim` + `samples/Retaguarda` (portados do repo
 4. ~~Heartbeat (thread própria) + reconexão + polimento/documentação.~~ **Concluído.** Passou por revisão (ultrareview) com correções aplicadas.
 5. ~~Adapter para `delphi-api-infra-faa` (`Messaging.Adapters.DelphiAmqpFaa.pas`, implementa `IMessagingFactory`/`IMessageConsumer`/`IMessagePublisher`, registra-se como `'rabbitmq'`).~~ **Concluído.**
 
-MVP completo. Próximos passos possíveis (não bloqueiam uso): publisher confirms/transações, recuperação de topologia para filas com nome gerado pelo servidor, tratamento de `Basic.Return`.
+MVP completo. Próximos passos possíveis (não bloqueiam uso): publisher confirms/transações, recuperação de topologia para filas com nome gerado pelo servidor. `Basic.Return` já é tratado (evento `OnBasicReturn`).
 
 ## Testes
 

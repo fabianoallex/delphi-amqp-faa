@@ -102,6 +102,16 @@ type
     RoutingKey: string;
   end;
 
+  { Argumentos de Basic.Return (a mensagem devolvida vem no content header +
+    body). Enviado pelo broker quando um publish `mandatory` não pôde ser
+    roteado a nenhuma fila. }
+  TAMQPBasicReturn = record
+    ReplyCode: Word;
+    ReplyText: string;
+    Exchange: string;
+    RoutingKey: string;
+  end;
+
 function BuildBasicPublish(const AExchange, ARoutingKey: string;
   AMandatory: Boolean = False; AImmediate: Boolean = False): TBytes;
 
@@ -123,6 +133,8 @@ function DecodeBasicCancelOk(const AReader: TAMQPReader): string;  // consumer-t
 function DecodeBasicCancel(const AReader: TAMQPReader): string;    // servidor -> cliente
 
 function DecodeBasicDeliver(const AReader: TAMQPReader): TAMQPBasicDeliver;
+
+function DecodeBasicReturn(const AReader: TAMQPReader): TAMQPBasicReturn;
 
 /// Payload do frame de content header (tipo 2). ABodySize = total do corpo.
 function BuildContentHeader(ABodySize: UInt64;
@@ -395,6 +407,14 @@ begin
   Result.ConsumerTag := AReader.ReadShortStr;
   Result.DeliveryTag := AReader.ReadLongLongUInt;
   Result.Redelivered := AReader.ReadBit;
+  Result.Exchange := AReader.ReadShortStr;
+  Result.RoutingKey := AReader.ReadShortStr;
+end;
+
+function DecodeBasicReturn(const AReader: TAMQPReader): TAMQPBasicReturn;
+begin
+  Result.ReplyCode := AReader.ReadShortUInt;
+  Result.ReplyText := AReader.ReadShortStr;
   Result.Exchange := AReader.ReadShortStr;
   Result.RoutingKey := AReader.ReadShortStr;
 end;

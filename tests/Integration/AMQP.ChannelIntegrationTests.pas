@@ -9,6 +9,7 @@ uses
   DUnitX.TestFramework,
   System.SysUtils,
   System.Classes,
+  System.SyncObjs,
   AMQP.Connection,
   AMQP.Queue.Methods,
   AMQP.Basic.Methods;
@@ -29,6 +30,7 @@ type
     [Test] procedure PublishText_EBusca;
     [Test] procedure GetEmpty_QuandoFilaVazia;
     [Test] procedure DeclareQueue_RetornaNomeGerado;
+    [Test] procedure PublishMandatory_SemRota_DisparaOnBasicReturn;
   end;
 
 implementation
@@ -126,6 +128,35 @@ var
 begin
   LQueue := DeclareTempQueue;
   Assert.IsTrue(LQueue <> '', 'servidor deveria gerar um nome de fila');
+end;
+
+procedure TAMQPChannelIntegrationTests.PublishMandatory_SemRota_DisparaOnBasicReturn;
+var
+  LReturned: TAMQPReturnedMessage;
+  LGotReturn: Integer; // 0/1, lido via TInterlocked (setado na thread do pool)
+  I: Integer;
+begin
+  LGotReturn := 0;
+  FChan.OnBasicReturn :=
+    procedure(AChannel: TAMQPChannel; const AReturned: TAMQPReturnedMessage)
+    begin
+      LReturned := AReturned;
+      TInterlocked.Exchange(LGotReturn, 1);
+    end;
+
+  // Exchange padrão + routing-key sem fila nenhuma ligada: não roteável.
+  FChan.Publish('', 'rota.inexistente.' + TGUID.NewGuid.ToString,
+    TEncoding.UTF8.GetBytes('sem destino'), TAMQPBasicProperties.Empty, True {mandatory});
+
+  for I := 1 to 80 do
+  begin
+    if TInterlocked.CompareExchange(LGotReturn, 0, 0) = 1 then
+      Break;
+    TThread.Sleep(25);
+  end;
+
+  Assert.AreEqual(1, TInterlocked.CompareExchange(LGotReturn, 0, 0), 'OnBasicReturn deveria disparar');
+  Assert.AreEqual('sem destino', LReturned.BodyAsText);
 end;
 
 initialization

@@ -117,6 +117,24 @@ type
   TAMQPConsumerCallback = reference to procedure(AChannel: TAMQPChannel;
     const ADelivery: TAMQPDelivery);
 
+  { Mensagem devolvida pelo broker (Basic.Return): um publish `mandatory` que
+    não pôde ser roteado a nenhuma fila. Se Properties tiver Headers, a tabela
+    é liberada automaticamente após o callback retornar. }
+  TAMQPReturnedMessage = record
+    ReplyCode: Word;
+    ReplyText: string;
+    Exchange: string;
+    RoutingKey: string;
+    Properties: TAMQPBasicProperties;
+    Body: TBytes;
+    function BodyAsText: string;
+  end;
+
+  { Callback de Basic.Return. Roda numa thread do pool (TTask), assim como o
+    callback de consumer — não bloqueia a thread de leitura. }
+  TAMQPBasicReturnCallback = reference to procedure(AChannel: TAMQPChannel;
+    const AReturned: TAMQPReturnedMessage);
+
   { Ação de topologia gravada para replay após reconexão. Guardamos o payload
     já serializado do método (qos/declare/bind/consume) — assim argumentos e
     flags vêm de graça. Consumers guardam também o tag e o callback. }
@@ -150,6 +168,7 @@ type
     FAsmMethodId: TAMQPMethodId;
     FAsmGetOk: TAMQPBasicGetOk;
     FAsmDeliver: TAMQPBasicDeliver;
+    FAsmReturn: TAMQPBasicReturn;
     FAsmProps: TAMQPBasicProperties;
     FAsmBody: TBytes;
     FAsmRemaining: UInt64;
@@ -157,6 +176,7 @@ type
     FConsumers: TDictionary<string, TAMQPConsumerCallback>;
     FConsumersLock: TCriticalSection;
     FConsumerCounter: Integer;
+    FOnBasicReturn: TAMQPBasicReturnCallback;
     FInFlight: Integer; // callbacks em execução no pool (atômico)
     // --- topologia gravada para reconexão ---
     FRecovery: TList<TAMQPRecoveryAction>;
@@ -178,6 +198,9 @@ type
     procedure CompleteContent;
     /// Despacha uma entrega para o callback do consumer, no thread pool.
     procedure DispatchDelivery(const ADeliver: TAMQPBasicDeliver;
+      const AProps: TAMQPBasicProperties; const ABody: TBytes);
+    /// Despacha um Basic.Return para OnBasicReturn, no thread pool.
+    procedure DispatchReturn(const AReturn: TAMQPBasicReturn;
       const AProps: TAMQPBasicProperties; const ABody: TBytes);
     /// Aguarda os callbacks em voo terminarem (usado ao fechar o canal).
     procedure DrainInFlight;
@@ -219,6 +242,9 @@ type
 
     property ChannelId: Word read FChannelId;
     property IsOpen: Boolean read FIsOpen;
+    /// Disparado quando o broker devolve um publish `mandatory` não roteável
+    /// (Basic.Return). Roda numa thread do pool (não bloqueia a leitura).
+    property OnBasicReturn: TAMQPBasicReturnCallback read FOnBasicReturn write FOnBasicReturn;
   end;
 
   TAMQPReaderThread = class(TThread)
@@ -335,6 +361,13 @@ end;
 { TAMQPDelivery }
 
 function TAMQPDelivery.BodyAsText: string;
+begin
+  Result := TEncoding.UTF8.GetString(Body);
+end;
+
+{ TAMQPReturnedMessage }
+
+function TAMQPReturnedMessage.BodyAsText: string;
 begin
   Result := TEncoding.UTF8.GetString(Body);
 end;
@@ -1427,6 +1460,46 @@ begin
     end);
 end;
 
+procedure TAMQPChannel.DispatchReturn(const AReturn: TAMQPBasicReturn;
+  const AProps: TAMQPBasicProperties; const ABody: TBytes);
+var
+  LCallback: TAMQPBasicReturnCallback;
+  LReturned: TAMQPReturnedMessage;
+begin
+  LCallback := FOnBasicReturn;
+
+  LReturned := Default(TAMQPReturnedMessage);
+  LReturned.ReplyCode := AReturn.ReplyCode;
+  LReturned.ReplyText := AReturn.ReplyText;
+  LReturned.Exchange := AReturn.Exchange;
+  LReturned.RoutingKey := AReturn.RoutingKey;
+  LReturned.Properties := AProps;
+  LReturned.Body := ABody;
+
+  if not Assigned(LCallback) then
+  begin
+    // sem handler: libera eventuais Headers e descarta (mesmo comportamento
+    // de antes de o Basic.Return ser tratado).
+    if LReturned.Properties.Has(bpHeaders) and Assigned(LReturned.Properties.Headers) then
+      LReturned.Properties.Headers.Free;
+    Exit;
+  end;
+
+  // Despacha para o pool nativo; a thread de leitura NÃO roda o callback.
+  TInterlocked.Increment(FInFlight);
+  TTask.Run(
+    procedure
+    begin
+      try
+        LCallback(Self, LReturned);
+      finally
+        if LReturned.Properties.Has(bpHeaders) and Assigned(LReturned.Properties.Headers) then
+          LReturned.Properties.Headers.Free;
+        TInterlocked.Decrement(FInFlight);
+      end;
+    end);
+end;
+
 procedure TAMQPChannel.DrainInFlight;
 begin
   // Espera SEM timeout: liberar o canal com um callback ainda em execução seria
@@ -1483,11 +1556,13 @@ begin
   end
   else if FAsmMethodId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_DELIVER) then
     DispatchDelivery(FAsmDeliver, FAsmProps, FAsmBody)
+  else if FAsmMethodId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_RETURN) then
+    DispatchReturn(FAsmReturn, FAsmProps, FAsmBody)
   else
   begin
-    // Basic.Return (publish mandatory não roteado) ou outro: descartamos o
-    // conteúdo. Como ninguém assume a posse das Properties aqui, liberamos a
-    // tabela de Headers se ela veio (senão vazaria a cada Return).
+    // Método desconhecido chegando por este caminho: descartamos o conteúdo.
+    // Como ninguém assume a posse das Properties aqui, liberamos a tabela de
+    // Headers se ela veio (senão vazaria).
     if FAsmProps.Has(bpHeaders) and Assigned(FAsmProps.Headers) then
     begin
       FAsmProps.Headers.Free;
@@ -1563,8 +1638,9 @@ begin
     end
     else if LId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_RETURN) then
     begin
-      // publish mandatory não roteado: guarda e drena o conteúdo (descartado).
+      // publish mandatory não roteado: conteúdo vem nos próximos frames.
       FAsmMethodId := LId;
+      FAsmReturn := DecodeBasicReturn(LReader);
       FAsmState := asHeader;
     end
     else if LId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_CANCEL) then

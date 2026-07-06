@@ -4,8 +4,8 @@ Cliente **AMQP 0-9-1** para Delphi, escrito do zero a partir da especificação
 pública do protocolo — sem dependências externas (usa só a RTL) e com licença
 **MIT** desde o primeiro commit.
 
-Testado ponta a ponta contra um **RabbitMQ** real: **71 testes unitários** (sem
-broker) + **12 de integração**.
+Testado ponta a ponta contra um **RabbitMQ** real: **72 testes unitários** (sem
+broker) + **15 de integração**.
 
 ## Recursos
 
@@ -20,6 +20,8 @@ broker) + **12 de integração**.
   detecção de conexão morta.
 - **Reconexão automática** com recuperação de topologia (redeclara filas/
   exchanges/bindings, restaura Qos e re-consome).
+- **`Basic.Return`**: publish `mandatory` não roteável dispara `OnBasicReturn`
+  (thread pool), em vez de ser descartado silenciosamente.
 - Sem VCL: funciona em console, serviço Windows, etc. (`System.Net.Socket`).
 
 ## Requisitos
@@ -105,6 +107,20 @@ LChannel.Publish('', 'nfe.respostas',
 
 O exchange vazio (`''`) roteia pela *routing key* = nome da fila (default
 exchange). Publicar é fire-and-forget (sem publisher confirms).
+
+Para saber se um publish `mandatory` não foi roteado a nenhuma fila, trate
+`OnBasicReturn` (dispara numa thread do pool, como o callback de consumer):
+
+```pascal
+LChannel.OnBasicReturn :=
+  procedure(AChannel: TAMQPChannel; const AReturned: TAMQPReturnedMessage)
+  begin
+    Log(Format('mensagem não roteada: %s (%d) exchange=%s rk=%s',
+      [AReturned.ReplyText, AReturned.ReplyCode, AReturned.Exchange, AReturned.RoutingKey]));
+  end;
+
+LChannel.Publish('nfe', 'resposta.inexistente', LBody, LProps, True {mandatory});
+```
 
 ### Consumir uma mensagem (pull)
 
@@ -207,7 +223,6 @@ Abra `AMQP.groupproj` no RAD Studio.
   fire-and-forget).
 - A recuperação de topologia na reconexão assume filas **nomeadas**; filas com
   nome gerado pelo servidor recebem um novo nome ao serem redeclaradas.
-- `Basic.Return` (mensagem `mandatory` não roteável) é descartado por ora.
 
 ## Integração com delphi-api-infra-faa
 

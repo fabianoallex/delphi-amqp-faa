@@ -36,6 +36,7 @@ type
     [Test] procedure BasicConsume_RoundTrip;
     [Test] procedure BasicConsumeOk_Decode;
     [Test] procedure BasicDeliver_Decode;
+    [Test] procedure BasicReturn_Decode;
   end;
 
   [TestFixture]
@@ -390,6 +391,37 @@ begin
       Assert.IsFalse(LDeliver.Redelivered);
       Assert.AreEqual('nfe.ex', LDeliver.Exchange);
       Assert.AreEqual('resp.rk', LDeliver.RoutingKey);
+    finally
+      R.Free;
+    end;
+  finally
+    W.Free;
+  end;
+end;
+
+procedure TChannelQueueExchangeTests.BasicReturn_Decode;
+var
+  W: TAMQPWriter;
+  R: TAMQPReader;
+  LId: TAMQPMethodId;
+  LReturn: TAMQPBasicReturn;
+begin
+  W := TAMQPWriter.Create;
+  try
+    WriteMethodHeader(W, AMQP_CLASS_BASIC, AMQP_BASIC_RETURN);
+    W.WriteShortUInt(312);         // reply-code (NO_ROUTE)
+    W.WriteShortStr('NO_ROUTE');   // reply-text
+    W.WriteShortStr('nfe.ex');     // exchange
+    W.WriteShortStr('resp.rk');    // routing-key
+    R := TAMQPReader.Create(W.ToBytes);
+    try
+      LId := ReadMethodHeader(R);
+      Assert.IsTrue(LId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_RETURN));
+      LReturn := DecodeBasicReturn(R);
+      Assert.AreEqual(Word(312), LReturn.ReplyCode);
+      Assert.AreEqual('NO_ROUTE', LReturn.ReplyText);
+      Assert.AreEqual('nfe.ex', LReturn.Exchange);
+      Assert.AreEqual('resp.rk', LReturn.RoutingKey);
     finally
       R.Free;
     end;
