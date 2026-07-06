@@ -23,6 +23,7 @@ uses
   AMQP.ChannelIntegrationTests in 'AMQP.ChannelIntegrationTests.pas',
   AMQP.ConsumeIntegrationTests in 'AMQP.ConsumeIntegrationTests.pas',
   AMQP.ReconnectIntegrationTests in 'AMQP.ReconnectIntegrationTests.pas',
+  AMQP.TlsIntegrationTests in 'AMQP.TlsIntegrationTests.pas',
   AMQP.ReviewRegressionTests in 'AMQP.ReviewRegressionTests.pas';
 
 var
