@@ -109,6 +109,13 @@ type
     interna; mantenha-o curto e não bloqueante. }
   TAMQPConnectionEvent = reference to procedure(AConnection: TAMQPConnection);
 
+  { Callback de Connection.Blocked (extensão RabbitMQ): o broker entrou em
+    resource alarm (memória/disco) e parou de aceitar publishes; AReason traz o
+    motivo. Despachado num thread do pool (não bloqueia a thread de leitura). O
+    par Unblocked usa TAMQPConnectionEvent. }
+  TAMQPConnectionBlockedEvent = reference to procedure(AConnection: TAMQPConnection;
+    const AReason: string);
+
   { Mensagem entregue a um consumer (Basic.Deliver). Se Properties tiver
     Headers, a tabela é liberada automaticamente após o callback retornar. }
   TAMQPDelivery = record
@@ -216,6 +223,10 @@ type
       const ACallback: TAMQPConsumerCallback = nil);
     /// Remove a gravação de recovery de um consumer (ao cancelá-lo).
     procedure RemoveConsumerRecovery(const AConsumerTag: string);
+    /// Remove da topologia gravada o bind equivalente a (fila, exchange, rota),
+    /// para que um unbind não seja desfeito por uma reconexão. Casa binds sem
+    /// Arguments (o caso comum), nas duas variantes de no-wait.
+    procedure RemoveBindRecovery(const AQueue, AExchange, ARoutingKey: string);
     /// Reabre o canal e replaya a topologia gravada (chamado na reconexão).
     procedure Recover;
     procedure Open;
@@ -250,6 +261,11 @@ type
     procedure DeclareExchange(const ADeclare: TAMQPExchangeDeclare);
     function DeclareQueue(const ADeclare: TAMQPQueueDeclare): TAMQPQueueDeclareOk;
     procedure BindQueue(const ABind: TAMQPQueueBind);
+    /// Desfaz um binding fila->exchange (queue.unbind). Sempre aguarda Unbind-Ok.
+    /// Também remove o bind equivalente da topologia gravada para reconexão, para
+    /// não ser recriado numa eventual reconexão (ver AddRecovery/Recover). Binds
+    /// com Arguments não-triviais não são reconciliados automaticamente.
+    procedure UnbindQueue(const AUnbind: TAMQPQueueUnbind);
 
     /// Coloca o canal em modo publisher confirms (confirm.select). A partir daí
     /// cada Publish recebe um seq-no e o broker o confirma via Basic.Ack/Nack —
@@ -352,6 +368,10 @@ type
     FOnDisconnect: TAMQPConnectionEvent;
     FOnReconnect: TAMQPConnectionEvent;
     FOnReconnectFailed: TAMQPConnectionEvent;
+    // --- Connection.Blocked/Unblocked (resource alarm do broker) ---
+    FOnBlocked: TAMQPConnectionBlockedEvent;
+    FOnUnblocked: TAMQPConnectionEvent;
+    FInFlightConn: Integer; // callbacks de conexão em execução no pool (atômico)
     // --- envio (serializado por FWriteLock) ---
     procedure SendFrameNoLock(AFrameType: Byte; AChannel: Word; const APayload: TBytes);
     procedure SendFrame(AFrameType: Byte; AChannel: Word; const APayload: TBytes);
@@ -372,6 +392,11 @@ type
     procedure HeartbeatTick;
     procedure DispatchFrame(const AFrame: TAMQPFrame);
     procedure HandleConnectionFrame(const AFrame: TAMQPFrame);
+    /// Despacha Connection.Blocked/Unblocked para o pool (não bloqueia a leitura).
+    procedure DispatchBlocked(const AReason: string);
+    procedure DispatchUnblocked;
+    /// Aguarda callbacks de conexão em voo terminarem (usado ao destruir).
+    procedure DrainConnCallbacks;
     procedure ReadThreadFinished(const AError: string);
     procedure UnregisterChannel(AChannelId: Word);
     // --- reconexão ---
@@ -400,6 +425,13 @@ type
     property OnReconnect: TAMQPConnectionEvent read FOnReconnect write FOnReconnect;
     /// Disparado quando a reconexão esgota as tentativas.
     property OnReconnectFailed: TAMQPConnectionEvent read FOnReconnectFailed write FOnReconnectFailed;
+    /// Disparado quando o broker sinaliza Connection.Blocked (resource alarm:
+    /// memória/disco cheios) e para de aceitar publishes. Roda num thread do pool.
+    /// Típico: setar uma flag atômica para pausar o publish até o OnUnblocked.
+    property OnBlocked: TAMQPConnectionBlockedEvent read FOnBlocked write FOnBlocked;
+    /// Disparado quando o broker sai do resource alarm (Connection.Unblocked) e
+    /// volta a aceitar publishes. Roda num thread do pool.
+    property OnUnblocked: TAMQPConnectionEvent read FOnUnblocked write FOnUnblocked;
   end;
 
 implementation
@@ -564,6 +596,7 @@ begin
     Close;
   except
   end;
+  DrainConnCallbacks; // callbacks Blocked/Unblocked em voo capturaram Self
   // Libera canais que o usuário não liberou (cada Free chama UnregisterChannel,
   // que remove do dicionário; por isso iteramos sobre uma cópia).
   if Assigned(FChannels) then
@@ -1042,10 +1075,61 @@ begin
       SendMethod(AMQP_CHANNEL_CONNECTION, BuildCloseOk);
       FCloseOkEvent.SetEvent;
       // (canais serão sinalizados quando a thread encerrar)
-    end;
+    end
+    else if LId.Matches(AMQP_CLASS_CONNECTION, AMQP_CONNECTION_BLOCKED) then
+      DispatchBlocked(DecodeBlocked(LReader))
+    else if LId.Matches(AMQP_CLASS_CONNECTION, AMQP_CONNECTION_UNBLOCKED) then
+      DispatchUnblocked;
   finally
     LReader.Free;
   end;
+end;
+
+procedure TAMQPConnection.DispatchBlocked(const AReason: string);
+var
+  LCallback: TAMQPConnectionBlockedEvent;
+begin
+  LCallback := FOnBlocked;
+  if not Assigned(LCallback) then
+    Exit;
+  // Pool nativo: a thread de leitura NÃO roda o callback do usuário.
+  TInterlocked.Increment(FInFlightConn);
+  TTask.Run(
+    procedure
+    begin
+      try
+        LCallback(Self, AReason);
+      finally
+        TInterlocked.Decrement(FInFlightConn);
+      end;
+    end);
+end;
+
+procedure TAMQPConnection.DispatchUnblocked;
+var
+  LCallback: TAMQPConnectionEvent;
+begin
+  LCallback := FOnUnblocked;
+  if not Assigned(LCallback) then
+    Exit;
+  TInterlocked.Increment(FInFlightConn);
+  TTask.Run(
+    procedure
+    begin
+      try
+        LCallback(Self);
+      finally
+        TInterlocked.Decrement(FInFlightConn);
+      end;
+    end);
+end;
+
+procedure TAMQPConnection.DrainConnCallbacks;
+begin
+  // Espera os callbacks Blocked/Unblocked em voo (capturaram Self) terminarem
+  // antes de o objeto ser liberado — mesmo racional do DrainInFlight do canal.
+  while TInterlocked.CompareExchange(FInFlightConn, 0, 0) > 0 do
+    TThread.Sleep(10);
 end;
 
 procedure TAMQPConnection.UnregisterChannel(AChannelId: Word);
@@ -1191,6 +1275,42 @@ begin
   try
     for I := FRecovery.Count - 1 downto 0 do
       if FRecovery[I].IsConsume and (FRecovery[I].ConsumerTag = AConsumerTag) then
+        FRecovery.Delete(I);
+  finally
+    FRecoveryLock.Leave;
+  end;
+end;
+
+procedure TAMQPChannel.RemoveBindRecovery(const AQueue, AExchange,
+  ARoutingKey: string);
+
+  function SameBytes(const A, B: TBytes): Boolean;
+  begin
+    Result := (Length(A) = Length(B)) and
+      ((Length(A) = 0) or CompareMem(@A[0], @B[0], Length(A)));
+  end;
+
+var
+  LBind: TAMQPQueueBind;
+  LCandNoWaitFalse, LCandNoWaitTrue: TBytes;
+  I: Integer;
+begin
+  // O recovery guarda o payload serializado do bind; reconstruímos os candidatos
+  // (nas duas variantes de no-wait, sem Arguments) e removemos os que casarem.
+  LBind := Default(TAMQPQueueBind);
+  LBind.QueueName := AQueue;
+  LBind.ExchangeName := AExchange;
+  LBind.RoutingKey := ARoutingKey;
+  LBind.NoWait := False;
+  LCandNoWaitFalse := BuildQueueBind(LBind);
+  LBind.NoWait := True;
+  LCandNoWaitTrue := BuildQueueBind(LBind);
+
+  FRecoveryLock.Enter;
+  try
+    for I := FRecovery.Count - 1 downto 0 do
+      if SameBytes(FRecovery[I].Payload, LCandNoWaitFalse) or
+         SameBytes(FRecovery[I].Payload, LCandNoWaitTrue) then
         FRecovery.Delete(I);
   finally
     FRecoveryLock.Leave;
@@ -1372,6 +1492,12 @@ begin
   else
     CallRpc(LPayload); // Bind-Ok (sem args, descartado)
   AddRecovery(LPayload, not ABind.NoWait);
+end;
+
+procedure TAMQPChannel.UnbindQueue(const AUnbind: TAMQPQueueUnbind);
+begin
+  CallRpc(BuildQueueUnbind(AUnbind)); // Unbind-Ok (sem args, descartado)
+  RemoveBindRecovery(AUnbind.QueueName, AUnbind.ExchangeName, AUnbind.RoutingKey);
 end;
 
 function TAMQPChannel.Publish(const AExchange, ARoutingKey: string;

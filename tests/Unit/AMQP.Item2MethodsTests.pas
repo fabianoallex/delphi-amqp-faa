@@ -27,6 +27,7 @@ type
     [Test] procedure QueueDeclare_RoundTrip;
     [Test] procedure QueueDeclareOk_Decode;
     [Test] procedure QueueBind_RoundTrip;
+    [Test] procedure QueueUnbind_RoundTrip;
     [Test] procedure BasicPublish_RoundTrip;
     [Test] procedure BasicGet_RoundTrip;
     [Test] procedure BasicGetOk_Decode;
@@ -197,6 +198,39 @@ begin
     Assert.AreEqual('nfe.exchange', R.ReadShortStr, 'exchange');
     Assert.AreEqual('resposta.autorizada', R.ReadShortStr, 'routing-key');
     Assert.IsFalse(R.ReadBit, 'no-wait');
+  finally
+    R.Free;
+  end;
+end;
+
+procedure TChannelQueueExchangeTests.QueueUnbind_RoundTrip;
+var
+  LUnbind: TAMQPQueueUnbind;
+  R: TAMQPReader;
+  LId: TAMQPMethodId;
+  LArgs: TAMQPFieldTable;
+begin
+  LUnbind := Default(TAMQPQueueUnbind);
+  LUnbind.QueueName := 'nfe.respostas';
+  LUnbind.ExchangeName := 'nfe.exchange';
+  LUnbind.RoutingKey := 'resposta.autorizada';
+
+  R := TAMQPReader.Create(BuildQueueUnbind(LUnbind));
+  try
+    LId := ReadMethodHeader(R);
+    Assert.IsTrue(LId.Matches(AMQP_CLASS_QUEUE, AMQP_QUEUE_UNBIND));
+    Assert.AreEqual(Word(0), R.ReadShortUInt, 'reserved-1');
+    Assert.AreEqual('nfe.respostas', R.ReadShortStr, 'queue');
+    Assert.AreEqual('nfe.exchange', R.ReadShortStr, 'exchange');
+    Assert.AreEqual('resposta.autorizada', R.ReadShortStr, 'routing-key');
+    // Diferente de bind: unbind NÃO tem no-wait — vem a field-table direto.
+    LArgs := R.ReadFieldTable;
+    try
+      Assert.AreEqual(0, LArgs.Count, 'arguments vazio');
+    finally
+      LArgs.Free;
+    end;
+    Assert.IsTrue(R.EndOfData, 'field-table encerra o payload');
   finally
     R.Free;
   end;

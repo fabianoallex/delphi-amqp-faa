@@ -57,6 +57,11 @@ const
   AMQP_CONNECTION_OPEN_OK   = 41;
   AMQP_CONNECTION_CLOSE    = 50;
   AMQP_CONNECTION_CLOSE_OK  = 51;
+  /// Extensao RabbitMQ: o broker avisa (canal 0) quando entra/sai de um
+  /// resource alarm (memoria/disco) e para/volta a aceitar publishes. So sao
+  /// enviados se o cliente anunciou a capability 'connection.blocked'.
+  AMQP_CONNECTION_BLOCKED   = 60;
+  AMQP_CONNECTION_UNBLOCKED = 61;
 
   // --- Metodos de Channel (classe 20) -------------------------------------
   AMQP_CHANNEL_OPEN     = 10;

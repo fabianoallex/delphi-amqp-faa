@@ -38,6 +38,15 @@ type
     Arguments: TAMQPFieldTable; // pode ser nil
   end;
 
+  { Desfaz um binding fila->exchange. Diferente de queue.bind, queue.unbind NÃO
+    tem flag no-wait no AMQP 0-9-1 — sempre aguarda Unbind-Ok. }
+  TAMQPQueueUnbind = record
+    QueueName: string;
+    ExchangeName: string;
+    RoutingKey: string;
+    Arguments: TAMQPFieldTable; // pode ser nil (deve casar com o do bind)
+  end;
+
   TAMQPQueueDelete = record
     QueueName: string;
     IfUnused: Boolean;
@@ -50,6 +59,9 @@ function DecodeQueueDeclareOk(const AReader: TAMQPReader): TAMQPQueueDeclareOk;
 
 function BuildQueueBind(const ABind: TAMQPQueueBind): TBytes;
 procedure DecodeQueueBindOk(const AReader: TAMQPReader);
+
+function BuildQueueUnbind(const AUnbind: TAMQPQueueUnbind): TBytes;
+procedure DecodeQueueUnbindOk(const AReader: TAMQPReader);
 
 function BuildQueuePurge(const AQueueName: string; ANoWait: Boolean = False): TBytes;
 function DecodeQueuePurgeOk(const AReader: TAMQPReader): Cardinal; // message-count
@@ -115,6 +127,28 @@ begin
 end;
 
 procedure DecodeQueueBindOk(const AReader: TAMQPReader);
+begin
+  // sem argumentos
+end;
+
+function BuildQueueUnbind(const AUnbind: TAMQPQueueUnbind): TBytes;
+var
+  W: TAMQPWriter;
+begin
+  W := BeginMethod(AMQP_CLASS_QUEUE, AMQP_QUEUE_UNBIND);
+  try
+    W.WriteShortUInt(0); // reserved-1
+    W.WriteShortStr(AUnbind.QueueName);
+    W.WriteShortStr(AUnbind.ExchangeName);
+    W.WriteShortStr(AUnbind.RoutingKey);
+    W.WriteFieldTable(AUnbind.Arguments); // sem no-wait: unbind sempre responde Ok
+    Result := W.ToBytes;
+  finally
+    W.Free;
+  end;
+end;
+
+procedure DecodeQueueUnbindOk(const AReader: TAMQPReader);
 begin
   // sem argumentos
 end;

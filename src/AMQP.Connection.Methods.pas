@@ -88,6 +88,10 @@ procedure DecodeOpenOk(const AReader: TAMQPReader);
 
 function DecodeClose(const AReader: TAMQPReader): TAMQPConnectionClose;
 
+/// Lê Connection.Blocked (extensão RabbitMQ): devolve o motivo (reason) informado
+/// pelo broker ao entrar em resource alarm. Connection.Unblocked não tem args.
+function DecodeBlocked(const AReader: TAMQPReader): string;
+
 function BuildClose(const AClose: TAMQPConnectionClose): TBytes;
 
 function BuildCloseOk: TBytes;
@@ -148,6 +152,7 @@ begin
   LCaps := TAMQPFieldTable.Create;
   LCaps.Put('authentication_failure_close', True)
        .Put('consumer_cancel_notify', True)
+       .Put('connection.blocked', True)
        .Put('publisher_confirms', True);
 
   Result := TAMQPFieldTable.Create;
@@ -238,6 +243,11 @@ begin
   Result.ReplyText := AReader.ReadShortStr;
   Result.ClassId := AReader.ReadShortUInt;
   Result.MethodId := AReader.ReadShortUInt;
+end;
+
+function DecodeBlocked(const AReader: TAMQPReader): string;
+begin
+  Result := AReader.ReadShortStr; // reason
 end;
 
 function BuildClose(const AClose: TAMQPConnectionClose): TBytes;

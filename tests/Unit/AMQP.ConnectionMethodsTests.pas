@@ -22,8 +22,10 @@ type
     [Test] procedure Open_RoundTrip;
     [Test] procedure OpenOk_Decode;
     [Test] procedure Close_RoundTrip;
+    [Test] procedure Blocked_Decode;
     [Test] procedure PlainAuth_Formato;
     [Test] procedure DefaultClientProperties_TemProduct;
+    [Test] procedure DefaultClientProperties_AnunciaConnectionBlocked;
   end;
 
   [TestFixture]
@@ -254,6 +256,31 @@ begin
   end;
 end;
 
+procedure TConnectionMethodsTests.Blocked_Decode;
+var
+  W: TAMQPWriter;
+  R: TAMQPReader;
+  LId: TAMQPMethodId;
+begin
+  // Connection.Blocked como o broker mandaria: só um shortstr com o motivo.
+  W := TAMQPWriter.Create;
+  try
+    WriteMethodHeader(W, AMQP_CLASS_CONNECTION, AMQP_CONNECTION_BLOCKED);
+    W.WriteShortStr('low on memory');
+    R := TAMQPReader.Create(W.ToBytes);
+    try
+      LId := ReadMethodHeader(R);
+      Assert.IsTrue(LId.Matches(AMQP_CLASS_CONNECTION, AMQP_CONNECTION_BLOCKED));
+      Assert.AreEqual('low on memory', DecodeBlocked(R), 'reason');
+      Assert.IsTrue(R.EndOfData);
+    finally
+      R.Free;
+    end;
+  finally
+    W.Free;
+  end;
+end;
+
 procedure TConnectionMethodsTests.PlainAuth_Formato;
 var
   S: string;
@@ -273,6 +300,22 @@ begin
   try
     Assert.AreEqual('delphi-amqp-faa', P['product'].AsString);
     Assert.IsTrue(P.ContainsKey('capabilities'));
+  finally
+    P.Free;
+  end;
+end;
+
+procedure TConnectionMethodsTests.DefaultClientProperties_AnunciaConnectionBlocked;
+var
+  P, LCaps: TAMQPFieldTable;
+begin
+  // O broker só envia Connection.Blocked/Unblocked se o cliente anunciar esta
+  // capability em client-properties -> tem de estar presente e True.
+  P := DefaultClientProperties;
+  try
+    LCaps := P['capabilities'].AsType<TAMQPFieldTable>;
+    Assert.IsTrue(LCaps.ContainsKey('connection.blocked'), 'capability presente');
+    Assert.IsTrue(LCaps['connection.blocked'].AsBoolean, 'capability = True');
   finally
     P.Free;
   end;

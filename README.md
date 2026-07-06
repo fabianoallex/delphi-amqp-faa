@@ -10,7 +10,7 @@ broker) + **18 de integração**.
 ## Recursos
 
 - Handshake de conexão completo (`AMQP0091`, PLAIN, negociação de tune).
-- Canais, `exchange.declare/delete`, `queue.declare/bind/purge/delete`.
+- Canais, `exchange.declare/delete`, `queue.declare/bind/unbind/purge/delete`.
 - **Publish** (com propriedades da mensagem) e **Basic.Get** (pull).
 - **Basic.Consume** (push) com despacho de cada mensagem para um **thread pool
   nativo** (`TTask`) — mensagens diferentes são processadas **em paralelo**,
@@ -27,6 +27,9 @@ broker) + **18 de integração**.
   `WaitForConfirm`/`WaitForConfirms` (síncrono).
 - **TLS (amqps://)** via **SChannel nativo do Windows** (SSPI) — sem OpenSSL nem
   DLLs externas; validação de certificado pela cadeia de confiança do Windows.
+- **`Connection.Blocked`/`Unblocked`**: quando o broker entra em *resource alarm*
+  (memória/disco) e para de aceitar publishes, dispara `OnBlocked`/`OnUnblocked`
+  (thread pool) — dá para pausar o publish até o broker liberar.
 - Sem VCL: funciona em console, serviço Windows, etc. (`System.Net.Socket`).
 
 ## Requisitos

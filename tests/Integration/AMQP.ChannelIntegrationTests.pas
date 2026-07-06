@@ -13,6 +13,7 @@ uses
   System.Rtti,
   AMQP.Connection,
   AMQP.Wire,
+  AMQP.Exchange.Methods,
   AMQP.Queue.Methods,
   AMQP.Basic.Methods;
 
@@ -32,6 +33,7 @@ type
     [Test] procedure PublishText_EBusca;
     [Test] procedure GetEmpty_QuandoFilaVazia;
     [Test] procedure DeclareQueue_RetornaNomeGerado;
+    [Test] procedure Unbind_ParaDeRotearParaAFila;
     [Test] procedure PublishMandatory_SemRota_DisparaOnBasicReturn;
     [Test] procedure Confirm_PublishRoteavel_Ackado;
     [Test] procedure Confirm_WaitForConfirms_VariosPublishes;
@@ -133,6 +135,52 @@ var
 begin
   LQueue := DeclareTempQueue;
   Assert.IsTrue(LQueue <> '', 'servidor deveria gerar um nome de fila');
+end;
+
+procedure TAMQPChannelIntegrationTests.Unbind_ParaDeRotearParaAFila;
+var
+  LExchange, LQueue, LRk: string;
+  LEx: TAMQPExchangeDeclare;
+  LBind: TAMQPQueueBind;
+  LUnbind: TAMQPQueueUnbind;
+  LResult: TAMQPGetResult;
+begin
+  LExchange := 'test-unbind-ex-' + TGUID.NewGuid.ToString;
+  LRk := 'rota.teste';
+  // Exchange NÃO durável (some ao fechar a conexão) e NÃO auto-delete: se fosse
+  // auto-delete, o unbind removeria o último binding e o broker apagaria a
+  // exchange — o publish seguinte cairia numa exchange inexistente e o servidor
+  // fecharia o canal de forma assíncrona (corrida com o TearDown). Mantendo-a
+  // viva, o publish sem binding é simplesmente descartado (é o que queremos).
+  LEx := TAMQPExchangeDeclare.Create(LExchange, AMQP_EXCHANGE_TYPE_DIRECT, False);
+  FChan.DeclareExchange(LEx);
+
+  LQueue := DeclareTempQueue;
+
+  LBind := Default(TAMQPQueueBind);
+  LBind.QueueName := LQueue;
+  LBind.ExchangeName := LExchange;
+  LBind.RoutingKey := LRk;
+  FChan.BindQueue(LBind);
+
+  // Com o bind, a mensagem chega à fila.
+  FChan.PublishText(LExchange, LRk, 'antes-do-unbind');
+  LResult := GetWithRetry(LQueue);
+  Assert.IsTrue(LResult.Found, 'com o bind, a mensagem deveria chegar');
+  Assert.AreEqual('antes-do-unbind', LResult.BodyAsText);
+
+  // Desfaz o binding.
+  LUnbind := Default(TAMQPQueueUnbind);
+  LUnbind.QueueName := LQueue;
+  LUnbind.ExchangeName := LExchange;
+  LUnbind.RoutingKey := LRk;
+  FChan.UnbindQueue(LUnbind);
+
+  // Sem o bind, a mesma publicação não é mais roteada para a fila.
+  FChan.PublishText(LExchange, LRk, 'depois-do-unbind');
+  TThread.Sleep(200); // dá tempo de o broker rotear (ou descartar)
+  LResult := FChan.BasicGet(LQueue, True);
+  Assert.IsFalse(LResult.Found, 'após o unbind, a fila não deveria mais receber');
 end;
 
 procedure TAMQPChannelIntegrationTests.PublishMandatory_SemRota_DisparaOnBasicReturn;
