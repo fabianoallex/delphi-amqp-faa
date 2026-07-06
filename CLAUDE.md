@@ -44,7 +44,7 @@ Demonstrado em `samples/AutorizadorSim` + `samples/Retaguarda` (portados do repo
 4. ~~Heartbeat (thread própria) + reconexão + polimento/documentação.~~ **Concluído.** Passou por revisão (ultrareview) com correções aplicadas.
 5. ~~Adapter para `delphi-api-infra-faa` (`Messaging.Adapters.DelphiAmqpFaa.pas`, implementa `IMessagingFactory`/`IMessageConsumer`/`IMessagePublisher`, registra-se como `'rabbitmq'`).~~ **Concluído.**
 
-MVP completo. Próximos passos possíveis (não bloqueiam uso): publisher confirms/transações, recuperação de topologia para filas com nome gerado pelo servidor. `Basic.Return` já é tratado (evento `OnBasicReturn`).
+MVP completo. **Publisher confirms** (`confirm.select`) implementados: `ConfirmSelect`, `Publish` retorna seq-no, `OnConfirm` (thread pool) + `WaitForConfirm`/`WaitForConfirms`. `Basic.Return` já é tratado (evento `OnBasicReturn`). **TLS (amqps://)** implementado via SChannel nativo do Windows (`src/AMQP.Transport.Tls.pas`, `UseTls`/`TlsVerifyPeer`) — sem OpenSSL/DLLs externas, aditivo ao transporte plain. Próximos passos possíveis (não bloqueiam uso): transações (`tx.*` — descartado por decisão de design, ver README), infra Docker/teste automatizado de TLS, mTLS/client-cert, recuperação de topologia para filas com nome gerado pelo servidor, reenvio automático de publishes não confirmados após reconexão.
 
 ## Testes
 

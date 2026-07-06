@@ -37,6 +37,9 @@ type
     [Test] procedure BasicConsumeOk_Decode;
     [Test] procedure BasicDeliver_Decode;
     [Test] procedure BasicReturn_Decode;
+    [Test] procedure ConfirmSelect_RoundTrip;
+    [Test] procedure BasicAckConfirm_Decode;
+    [Test] procedure BasicNackConfirm_Decode;
   end;
 
   [TestFixture]
@@ -422,6 +425,78 @@ begin
       Assert.AreEqual('NO_ROUTE', LReturn.ReplyText);
       Assert.AreEqual('nfe.ex', LReturn.Exchange);
       Assert.AreEqual('resp.rk', LReturn.RoutingKey);
+    finally
+      R.Free;
+    end;
+  finally
+    W.Free;
+  end;
+end;
+
+procedure TChannelQueueExchangeTests.ConfirmSelect_RoundTrip;
+var
+  R: TAMQPReader;
+  LId: TAMQPMethodId;
+begin
+  R := TAMQPReader.Create(BuildConfirmSelect(False));
+  try
+    LId := ReadMethodHeader(R);
+    Assert.IsTrue(LId.Matches(AMQP_CLASS_CONFIRM, AMQP_CONFIRM_SELECT));
+    Assert.IsFalse(R.ReadBit, 'no-wait');
+  finally
+    R.Free;
+  end;
+end;
+
+procedure TChannelQueueExchangeTests.BasicAckConfirm_Decode;
+var
+  W: TAMQPWriter;
+  R: TAMQPReader;
+  LId: TAMQPMethodId;
+  LAck: TAMQPBasicAck;
+begin
+  // Basic.Ack vindo do broker (publisher confirm): delivery-tag = seq-no.
+  W := TAMQPWriter.Create;
+  try
+    WriteMethodHeader(W, AMQP_CLASS_BASIC, AMQP_BASIC_ACK);
+    W.WriteLongLongUInt(5);   // delivery-tag (seq-no)
+    W.WriteBit(True);         // multiple
+    R := TAMQPReader.Create(W.ToBytes);
+    try
+      LId := ReadMethodHeader(R);
+      Assert.IsTrue(LId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_ACK));
+      LAck := DecodeBasicAck(R);
+      Assert.IsTrue(UInt64(5) = LAck.DeliveryTag, 'delivery-tag');
+      Assert.IsTrue(LAck.Multiple, 'multiple');
+    finally
+      R.Free;
+    end;
+  finally
+    W.Free;
+  end;
+end;
+
+procedure TChannelQueueExchangeTests.BasicNackConfirm_Decode;
+var
+  W: TAMQPWriter;
+  R: TAMQPReader;
+  LId: TAMQPMethodId;
+  LNack: TAMQPBasicNack;
+begin
+  W := TAMQPWriter.Create;
+  try
+    WriteMethodHeader(W, AMQP_CLASS_BASIC, AMQP_BASIC_NACK);
+    W.WriteLongLongUInt(8);   // delivery-tag (seq-no)
+    W.WriteBit(False);        // multiple
+    W.WriteBit(False);        // requeue
+    R := TAMQPReader.Create(W.ToBytes);
+    try
+      LId := ReadMethodHeader(R);
+      Assert.IsTrue(LId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_NACK));
+      LNack := DecodeBasicNack(R);
+      Assert.IsTrue(UInt64(8) = LNack.DeliveryTag, 'delivery-tag');
+      Assert.IsFalse(LNack.Multiple, 'multiple');
+      Assert.IsFalse(LNack.Requeue, 'requeue');
     finally
       R.Free;
     end;

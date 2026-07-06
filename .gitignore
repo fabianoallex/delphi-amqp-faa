@@ -32,3 +32,6 @@ OSXARM64/
 
 # DCU output (se usar subdir)
 dcu/
+
+# Certificados de dev do broker TLS (gerados localmente, descartáveis)
+docker/certs/

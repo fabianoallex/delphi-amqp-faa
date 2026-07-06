@@ -41,6 +41,9 @@ const
   AMQP_CLASS_EXCHANGE   = 40;
   AMQP_CLASS_QUEUE      = 50;
   AMQP_CLASS_BASIC      = 60;
+  /// Extensao 'confirm' da RabbitMQ (publisher confirms). Nao faz parte do
+  /// AMQP 0-9-1 base, mas e' amplamente suportada; ver AMQP.Basic.Methods.
+  AMQP_CLASS_CONFIRM    = 85;
   AMQP_CLASS_TX         = 90;
 
   // --- Metodos de Connection (classe 10) ----------------------------------
@@ -97,6 +100,10 @@ const
   AMQP_BASIC_ACK        = 80;
   AMQP_BASIC_REJECT     = 90;
   AMQP_BASIC_NACK       = 120;
+
+  // --- Metodos de Confirm (classe 85, extensao RabbitMQ) ------------------
+  AMQP_CONFIRM_SELECT    = 10;
+  AMQP_CONFIRM_SELECT_OK = 11;
 
 implementation
 

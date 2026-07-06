@@ -10,7 +10,9 @@ uses
   System.SysUtils,
   System.Classes,
   System.SyncObjs,
+  System.Rtti,
   AMQP.Connection,
+  AMQP.Wire,
   AMQP.Queue.Methods,
   AMQP.Basic.Methods;
 
@@ -31,6 +33,9 @@ type
     [Test] procedure GetEmpty_QuandoFilaVazia;
     [Test] procedure DeclareQueue_RetornaNomeGerado;
     [Test] procedure PublishMandatory_SemRota_DisparaOnBasicReturn;
+    [Test] procedure Confirm_PublishRoteavel_Ackado;
+    [Test] procedure Confirm_WaitForConfirms_VariosPublishes;
+    [Test] procedure Confirm_WaitForConfirms_DetectaNackJaResolvido;
   end;
 
 implementation
@@ -157,6 +162,117 @@ begin
 
   Assert.AreEqual(1, TInterlocked.CompareExchange(LGotReturn, 0, 0), 'OnBasicReturn deveria disparar');
   Assert.AreEqual('sem destino', LReturned.BodyAsText);
+end;
+
+procedure TAMQPChannelIntegrationTests.Confirm_PublishRoteavel_Ackado;
+var
+  LQueue: string;
+  LSeq, LConfirmedSeq: UInt64;
+  LAck: Integer; // 0/1, lido via TInterlocked (setado na thread do pool)
+  I: Integer;
+begin
+  LQueue := DeclareTempQueue;
+  LConfirmedSeq := 0;
+  LAck := 0;
+  FChan.OnConfirm :=
+    procedure(AChannel: TAMQPChannel; ASeqNo: UInt64; AAck: Boolean)
+    begin
+      LConfirmedSeq := ASeqNo;
+      if AAck then
+        TInterlocked.Exchange(LAck, 1);
+    end;
+  FChan.ConfirmSelect;
+
+  // Exchange padrão + routing-key = nome da fila: roteável, o broker confirma.
+  LSeq := FChan.PublishText('', LQueue, 'confirma isso');
+  Assert.IsTrue(UInt64(1) = LSeq, 'primeiro publish em confirm mode deveria receber seq-no 1');
+  Assert.IsTrue(FChan.WaitForConfirm(LSeq, 5000), 'broker deveria confirmar (ack) o publish');
+
+  for I := 1 to 80 do
+  begin
+    if TInterlocked.CompareExchange(LAck, 0, 0) = 1 then
+      Break;
+    TThread.Sleep(25);
+  end;
+  Assert.AreEqual(1, TInterlocked.CompareExchange(LAck, 0, 0), 'OnConfirm deveria disparar com ack');
+  Assert.IsTrue(UInt64(1) = LConfirmedSeq, 'OnConfirm deveria trazer o seq-no 1');
+end;
+
+procedure TAMQPChannelIntegrationTests.Confirm_WaitForConfirms_VariosPublishes;
+var
+  LQueue: string;
+  I: Integer;
+  LLast: UInt64;
+begin
+  LQueue := DeclareTempQueue;
+  FChan.ConfirmSelect;
+
+  LLast := 0;
+  for I := 1 to 10 do
+    LLast := FChan.PublishText('', LQueue, 'msg ' + IntToStr(I));
+  Assert.IsTrue(UInt64(10) = LLast, 'décimo publish deveria receber seq-no 10');
+
+  Assert.IsTrue(FChan.WaitForConfirms(5000),
+    'todos os publishes roteáveis deveriam ser confirmados');
+end;
+
+procedure TAMQPChannelIntegrationTests.Confirm_WaitForConfirms_DetectaNackJaResolvido;
+var
+  LArgs: TAMQPFieldTable;
+  LDecl: TAMQPQueueDeclare;
+  LQueue: string;
+  LAckCount, LNackCount: Integer;
+  I: Integer;
+begin
+  // Fila que REJEITA publishes quando cheia: x-max-length=1 + x-overflow=reject-publish.
+  // Em confirm mode, o publish que estoura o limite volta como Basic.Nack.
+  LArgs := TAMQPFieldTable.Create;
+  try
+    LArgs.Put('x-max-length', TValue.From<Integer>(1));
+    LArgs.Put('x-overflow', 'reject-publish');
+    LDecl := Default(TAMQPQueueDeclare);
+    LDecl.Exclusive := True;
+    LDecl.AutoDelete := True;
+    LDecl.Arguments := LArgs;
+    LQueue := FChan.DeclareQueue(LDecl).QueueName;
+  finally
+    LArgs.Free;
+  end;
+
+  LAckCount := 0;
+  LNackCount := 0;
+  FChan.OnConfirm :=
+    procedure(AChannel: TAMQPChannel; ASeqNo: UInt64; AAck: Boolean)
+    begin
+      if AAck then
+        TInterlocked.Increment(LAckCount)
+      else
+        TInterlocked.Increment(LNackCount);
+    end;
+  FChan.ConfirmSelect;
+
+  FChan.PublishText('', LQueue, 'A'); // enche a fila -> ack
+  FChan.PublishText('', LQueue, 'B'); // estoura o limite -> nack
+
+  // Espera AMBOS resolverem ANTES de chamar WaitForConfirms — é justamente isso
+  // que expõe o achado #1: o nack já chegou quando WaitForConfirms é chamado.
+  for I := 1 to 200 do
+  begin
+    if (TInterlocked.CompareExchange(LAckCount, 0, 0) +
+        TInterlocked.CompareExchange(LNackCount, 0, 0)) >= 2 then
+      Break;
+    TThread.Sleep(25);
+  end;
+
+  // Prova que o cenário funcionou (1 ack + 1 nack) — se o broker não nack-ar,
+  // esta asserção falha com mensagem clara, em vez de mascarar o teste real.
+  Assert.AreEqual(1, TInterlocked.CompareExchange(LNackCount, 0, 0),
+    'o publish B deveria ter sido nack-ado (reject-publish)');
+
+  // O achado #1: como um publish do lote foi nack-ado, WaitForConfirms deve
+  // retornar False — mesmo o nack tendo chegado ANTES da chamada.
+  Assert.IsFalse(FChan.WaitForConfirms(2000),
+    'WaitForConfirms deve reportar False quando um publish do lote foi nack-ado');
 end;
 
 initialization

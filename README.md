@@ -4,8 +4,8 @@ Cliente **AMQP 0-9-1** para Delphi, escrito do zero a partir da especificação
 pública do protocolo — sem dependências externas (usa só a RTL) e com licença
 **MIT** desde o primeiro commit.
 
-Testado ponta a ponta contra um **RabbitMQ** real: **72 testes unitários** (sem
-broker) + **15 de integração**.
+Testado ponta a ponta contra um **RabbitMQ** real: **75 testes unitários** (sem
+broker) + **18 de integração**.
 
 ## Recursos
 
@@ -22,6 +22,11 @@ broker) + **15 de integração**.
   exchanges/bindings, restaura Qos e re-consome).
 - **`Basic.Return`**: publish `mandatory` não roteável dispara `OnBasicReturn`
   (thread pool), em vez de ser descartado silenciosamente.
+- **Publisher confirms** (`confirm.select`): cada publish recebe um seq-no e é
+  confirmado pelo broker — via `OnConfirm` (assíncrono) e/ou
+  `WaitForConfirm`/`WaitForConfirms` (síncrono).
+- **TLS (amqps://)** via **SChannel nativo do Windows** (SSPI) — sem OpenSSL nem
+  DLLs externas; validação de certificado pela cadeia de confiança do Windows.
 - Sem VCL: funciona em console, serviço Windows, etc. (`System.Net.Socket`).
 
 ## Requisitos
@@ -72,6 +77,31 @@ end;
 > O `TAMQPConnection` é dono das threads internas (leitura + heartbeat). Libere
 > os canais antes da conexão (ou deixe o `Free` da conexão cuidar deles).
 
+### Conectar com TLS (amqps://)
+
+TLS usa o **SChannel nativo do Windows** (via SSPI) — sem OpenSSL, sem DLLs
+externas. Basta ligar `UseTls` (porta padrão do broker: 5671):
+
+```pascal
+LParams := TAMQPConnectionParams.Localhost;
+LParams.Host := 'broker.example.com';
+LParams.Port := 5671;
+LParams.UseTls := True;          // handshake TLS antes do AMQP
+// LParams.TlsVerifyPeer := True; // padrão: valida cadeia + hostname (Windows)
+// LParams.TlsServerName := '';   // '' => usa Host (SNI / nome p/ validação)
+```
+
+Por padrão o certificado do servidor é validado pela cadeia de confiança do
+Windows (inclui checagem de hostname). Para um broker de **desenvolvimento** com
+certificado *self-signed*, desligue a validação — ou use o atalho `LocalhostTls`
+(porta 5671, `TlsVerifyPeer=False`):
+
+```pascal
+LParams := TAMQPConnectionParams.LocalhostTls; // TLS em 5671, validação off (dev)
+```
+
+> Só Windows (SChannel). mTLS/client-cert não estão nesta versão.
+
 ### Declarar fila / exchange / binding
 
 ```pascal
@@ -106,7 +136,46 @@ LChannel.Publish('', 'nfe.respostas',
 ```
 
 O exchange vazio (`''`) roteia pela *routing key* = nome da fila (default
-exchange). Publicar é fire-and-forget (sem publisher confirms).
+exchange). Sem confirm mode, publicar é fire-and-forget e `Publish` retorna 0.
+
+### Publish com confirmação (publisher confirms)
+
+`ConfirmSelect` coloca o canal em modo confirm: a partir daí cada `Publish`
+recebe um *seq-no* (1, 2, 3, ...) e o broker o confirma (`ack`) ou rejeita
+(`nack`). Dá para tratar de forma assíncrona com `OnConfirm` e/ou bloquear até a
+confirmação com `WaitForConfirm` (um publish) ou `WaitForConfirms` (todos os
+pendentes):
+
+```pascal
+LChannel.ConfirmSelect;
+
+// Assíncrono: notificado numa thread do pool quando cada publish é confirmado.
+LChannel.OnConfirm :=
+  procedure(AChannel: TAMQPChannel; ASeqNo: UInt64; AAck: Boolean)
+  begin
+    if not AAck then
+      Log(Format('publish %d foi NACK-ado pelo broker', [ASeqNo]));
+  end;
+
+// Síncrono: bloqueia até o broker confirmar este publish.
+var LSeq: UInt64;
+LSeq := LChannel.Publish('', 'nfe.respostas', LBody, LProps);
+if LChannel.WaitForConfirm(LSeq, 5000) then
+  Writeln('confirmado')
+else
+  Writeln('não confirmado (nack, queda de conexão ou timeout)');
+
+// Ou publique em lote e espere todos de uma vez:
+LChannel.Publish('', 'nfe.respostas', LBody1, LProps);
+LChannel.Publish('', 'nfe.respostas', LBody2, LProps);
+if not LChannel.WaitForConfirms(5000) then
+  Writeln('algum publish não foi confirmado');
+```
+
+Se a conexão cair antes da confirmação, o publish pendente é reportado como
+**não confirmado** (`WaitForConfirm` retorna `False`); `OnConfirm` dispara apenas
+para confirmações reais do broker. Após uma reconexão a numeração de seq-no
+reinicia (canal novo) — ver *Limitações conhecidas*.
 
 Para saber se um publish `mandatory` não foi roteado a nenhuma fila, trate
 `OnBasicReturn` (dispara numa thread do pool, como o callback de consumer):
@@ -219,10 +288,26 @@ Abra `AMQP.groupproj` no RAD Studio.
 
 ## Limitações conhecidas
 
-- Publisher confirms e transações ainda não implementados (publish é
-  fire-and-forget).
+- Transações (`tx.*`) **não implementadas — por decisão de design**, não por
+  dificuldade técnica (o protocolo `tx.*` é trivial). Uma transação AMQP é
+  *stateful e por canal* ("tudo que publiquei/dei ack desde o último commit"),
+  o que casa mal com o modelo *concurrency-first* desta lib: várias threads
+  publicando no mesmo canal cairiam todas na mesma transação, sem escopo
+  por-thread. Além disso, `tx.*` é síncrono e lento, e a própria RabbitMQ
+  recomenda **publisher confirms** no lugar — que já estão implementados
+  (`ConfirmSelect`) e cobrem a garantia "meu publish chegou?". Se surgir
+  necessidade real de lote atômico, o subconjunto tratável é
+  `Tx.Select/Commit/Rollback` para uso serial em canal dedicado.
+- Publisher confirms + reconexão: ao reconectar, o canal reinicia a numeração de
+  seq-no e o modo confirm é re-armado, mas publishes não confirmados antes da
+  queda ficam em estado ambíguo — são reportados como **não confirmados**
+  (`WaitForConfirm` retorna `False`), não reenviados automaticamente. Reenvie na
+  sua camada se precisar de garantia ponta a ponta.
 - A recuperação de topologia na reconexão assume filas **nomeadas**; filas com
   nome gerado pelo servidor recebem um novo nome ao serem redeclaradas.
+- TLS é **só Windows** (SChannel). mTLS/client-cert, escolha manual de versão/
+  cipher suite e exposição de TLS no adapter de `delphi-api-infra-faa` ainda não
+  estão implementados.
 
 ## Integração com delphi-api-infra-faa
 

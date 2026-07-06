@@ -18,8 +18,11 @@
   Invariantes (para não introduzir corrida/deadlock):
   - Só a thread de leitura lê o socket depois do handshake.
   - Ordem de locks sempre "de fora pra dentro": FChannelsLock -> FWriteLock e
-    FRpcLock -> FWriteLock. FWriteLock é sempre o mais interno (nunca se adquire
-    outro lock segurando ele).
+    FRpcLock -> FWriteLock. FWriteLock nunca envolve FChannelsLock/FRpcLock.
+  - O monitor de confirms (FConfirmMon, publisher confirms) é o lock MAIS interno:
+    é adquirido sozinho (WaitForConfirm) ou dentro do FWriteLock (Publish) ou
+    dentro do FChannelsLock (ao resolver acks na thread de leitura); nunca se
+    adquire outro lock segurando-o.
   - A thread de leitura escreve o slot de RPC e chama SetEvent; o chamador só lê
     o slot depois de WaitFor retornar (o evento é a barreira de sincronização).
 
@@ -74,8 +77,15 @@ type
     ReconnectDelayMs: Cardinal;    // espera entre tentativas (padrão 2000)
     MaxReconnectAttempts: Integer; // 0 = infinitas
     ConnectionName: string;        // opcional; vai em client-properties
-    /// Parâmetros padrão: localhost:5672, vhost '/', guest/guest.
+    // TLS (amqps://) via SChannel nativo. Opt-in.
+    UseTls: Boolean;               // True => faz handshake TLS antes do AMQP
+    TlsVerifyPeer: Boolean;        // True (padrão): valida cadeia + hostname
+    TlsServerName: string;         // '' => usa Host (SNI / nome para validação)
+    /// Parâmetros padrão: localhost:5672, vhost '/', guest/guest (sem TLS).
     class function Localhost: TAMQPConnectionParams; static;
+    /// Como Localhost, mas TLS na porta 5671 com validação DESLIGADA
+    /// (TlsVerifyPeer=False) — conveniência para broker de dev com cert self-signed.
+    class function LocalhostTls: TAMQPConnectionParams; static;
   end;
 
   { Resultado de Basic.Get. Se Found=False, a fila estava vazia. Se
@@ -135,6 +145,14 @@ type
   TAMQPBasicReturnCallback = reference to procedure(AChannel: TAMQPChannel;
     const AReturned: TAMQPReturnedMessage);
 
+  { Callback de publisher confirm: o broker (a)ck-ou ou (n)ack-ou o publish de
+    número ASeqNo (o valor devolvido por Publish). Roda numa thread do pool,
+    como os demais callbacks — não bloqueia a thread de leitura. Dispara só em
+    confirmações reais do broker; queda de conexão NÃO dispara OnConfirm (o
+    publish pendente é reportado como não confirmado via WaitForConfirm). }
+  TAMQPConfirmCallback = reference to procedure(AChannel: TAMQPChannel;
+    ASeqNo: UInt64; AAck: Boolean);
+
   { Ação de topologia gravada para replay após reconexão. Guardamos o payload
     já serializado do método (qos/declare/bind/consume) — assim argumentos e
     flags vêm de graça. Consumers guardam também o tag e o callback. }
@@ -178,6 +196,17 @@ type
     FConsumerCounter: Integer;
     FOnBasicReturn: TAMQPBasicReturnCallback;
     FInFlight: Integer; // callbacks em execução no pool (atômico)
+    // --- publisher confirms ---
+    // FConfirmMon é lock + variável de condição (System.TMonitor) que protege
+    // FUnconfirmed/FNacked/FPublishSeqNo e acorda WaitForConfirm(s).
+    // Ordem de locks: é o lock MAIS interno — só se adquire sozinho ou dentro do
+    // FWriteLock (Publish); nunca se adquire outro lock segurando-o.
+    FConfirmMode: Boolean;
+    FPublishSeqNo: UInt64;                  // último seq-no atribuído (1º publish = 1)
+    FConfirmMon: TObject;
+    FUnconfirmed: TDictionary<UInt64, Boolean>; // seq-nos aguardando confirmação
+    FNacked: TDictionary<UInt64, Boolean>;      // seq-nos nack-ados (ou perdidos na queda)
+    FOnConfirm: TAMQPConfirmCallback;
     // --- topologia gravada para reconexão ---
     FRecovery: TList<TAMQPRecoveryAction>;
     FRecoveryLock: TCriticalSection;
@@ -202,6 +231,13 @@ type
     /// Despacha um Basic.Return para OnBasicReturn, no thread pool.
     procedure DispatchReturn(const AReturn: TAMQPBasicReturn;
       const AProps: TAMQPBasicProperties; const ABody: TBytes);
+    /// Despacha um confirm (ack/nack do broker) para OnConfirm, no thread pool.
+    procedure DispatchConfirm(ASeqNo: UInt64; AAck: Boolean);
+    /// Resolve os seq-nos pendentes cobertos por (tag, multiple); devolve a lista
+    /// resolvida (para despachar OnConfirm fora do lock). Roda na thread de leitura.
+    function ResolveConfirms(ATag: UInt64; AMultiple, AAck: Boolean): TArray<UInt64>;
+    /// Marca todos os publishes pendentes como não confirmados (queda de conexão).
+    procedure FailAllUnconfirmed;
     /// Aguarda os callbacks em voo terminarem (usado ao fechar o canal).
     procedure DrainInFlight;
     /// Trata um frame entregue pela thread de leitura (roda NA thread de leitura).
@@ -214,12 +250,31 @@ type
     function DeclareQueue(const ADeclare: TAMQPQueueDeclare): TAMQPQueueDeclareOk;
     procedure BindQueue(const ABind: TAMQPQueueBind);
 
-    /// Publica ABody com as propriedades AProps. Fire-and-forget (sem confirms).
-    procedure Publish(const AExchange, ARoutingKey: string; const ABody: TBytes;
-      const AProps: TAMQPBasicProperties; AMandatory: Boolean = False);
+    /// Coloca o canal em modo publisher confirms (confirm.select). A partir daí
+    /// cada Publish recebe um seq-no e o broker o confirma via Basic.Ack/Nack —
+    /// use OnConfirm (assíncrono) e/ou WaitForConfirm/WaitForConfirms. Idempotente.
+    procedure ConfirmSelect;
+
+    /// Publica ABody com as propriedades AProps. Sem confirm mode: fire-and-forget
+    /// e retorna 0. Em confirm mode: retorna o seq-no atribuído (1, 2, 3, ...),
+    /// que identifica este publish em OnConfirm/WaitForConfirm.
+    function Publish(const AExchange, ARoutingKey: string; const ABody: TBytes;
+      const AProps: TAMQPBasicProperties; AMandatory: Boolean = False): UInt64;
     /// Conveniência: publica um texto UTF-8 como content-type text/plain.
-    procedure PublishText(const AExchange, ARoutingKey, AText: string;
-      APersistent: Boolean = True);
+    /// Retorna o seq-no como Publish (0 fora do confirm mode).
+    function PublishText(const AExchange, ARoutingKey, AText: string;
+      APersistent: Boolean = True): UInt64;
+
+    /// Bloqueia até o broker confirmar o publish ASeqNo. Result=True se ack-ado;
+    /// False se nack-ado, se a conexão caiu antes da confirmação, ou timeout.
+    /// Requer confirm mode. ASeqNo deve ser um valor devolvido por Publish.
+    function WaitForConfirm(ASeqNo: UInt64; ATimeoutMs: Cardinal = 5000): Boolean;
+    /// Bloqueia até todos os publishes pendentes serem confirmados. Result=True
+    /// se todos foram ack-ados dentro do timeout; False se algum foi nack-ado (ou
+    /// perdido numa queda) ou se estourou o timeout. Requer confirm mode.
+    /// Consome o estado de nacks do lote — não misture com WaitForConfirm(seqno)
+    /// para os mesmos publishes (use um ou outro por lote).
+    function WaitForConfirms(ATimeoutMs: Cardinal = 5000): Boolean;
 
     /// Busca uma mensagem da fila. Result.Found=False se estava vazia.
     function BasicGet(const AQueue: string; ANoAck: Boolean = True): TAMQPGetResult;
@@ -245,6 +300,10 @@ type
     /// Disparado quando o broker devolve um publish `mandatory` não roteável
     /// (Basic.Return). Roda numa thread do pool (não bloqueia a leitura).
     property OnBasicReturn: TAMQPBasicReturnCallback read FOnBasicReturn write FOnBasicReturn;
+    /// Disparado quando o broker confirma (ack/nack) um publish em confirm mode.
+    /// Roda numa thread do pool. Configure antes de publicar. Opcional — dá para
+    /// usar só WaitForConfirm/WaitForConfirms.
+    property OnConfirm: TAMQPConfirmCallback read FOnConfirm write FOnConfirm;
   end;
 
   TAMQPReaderThread = class(TThread)
@@ -272,7 +331,7 @@ type
   private
     FParams: TAMQPConnectionParams;
     FSocket: TSocket;
-    FStream: TAMQPSocketStream;
+    FStream: TStream; // TAMQPSocketStream (plain) ou TAMQPSchannelStream (TLS)
     FIsOpen: Boolean;
     FNegotiated: TAMQPConnectionTune;
     FNextChannel: Word;
@@ -346,7 +405,8 @@ implementation
 
 uses
   System.Threading,
-  AMQP.Channel.Methods;
+  AMQP.Channel.Methods,
+  AMQP.Transport.Tls;
 
 const
   AMQP_RPC_TIMEOUT_MS = 30000; // tempo máximo aguardando resposta de RPC
@@ -411,6 +471,17 @@ begin
   Result.ReconnectDelayMs := 2000;
   Result.MaxReconnectAttempts := 0; // infinitas
   Result.ConnectionName := '';
+  Result.UseTls := False;
+  Result.TlsVerifyPeer := True;
+  Result.TlsServerName := '';
+end;
+
+class function TAMQPConnectionParams.LocalhostTls: TAMQPConnectionParams;
+begin
+  Result := Localhost;
+  Result.Port := 5671;
+  Result.UseTls := True;
+  Result.TlsVerifyPeer := False; // dev: aceita cert self-signed
 end;
 
 { TAMQPReaderThread }
@@ -654,14 +725,32 @@ begin
 end;
 
 procedure TAMQPConnection.EstablishConnection;
+var
+  LPlain: TAMQPSocketStream;
+  LTarget: string;
 begin
   // Cria socket, faz o handshake (síncrono, inline) e sobe as threads.
   // Usado tanto no Open inicial quanto na reconexão.
   FSocket := TSocket.Create(TSocketType.TCP);
   FSocket.Connect(FParams.Host, '', '', FParams.Port);
-  FStream := TAMQPSocketStream.Create(FSocket);
 
-  Handshake; // antes de qualquer thread
+  LPlain := TAMQPSocketStream.Create(FSocket);
+  FStream := LPlain;
+  if FParams.UseTls then
+  begin
+    // O stream TLS envolve o plain e faz o handshake TLS no construtor. Ele passa
+    // a ser dono do plain: se o Create falhar, seu destrutor (auto-chamado pelo
+    // Delphi) libera o plain — por isso zeramos FStream antes, para o
+    // CloseSocketStream não liberar de novo (double-free). O socket é liberado à
+    // parte (o plain não é dono dele).
+    LTarget := FParams.TlsServerName;
+    if LTarget = '' then
+      LTarget := FParams.Host;
+    FStream := nil;
+    FStream := TAMQPSchannelStream.Create(LPlain, LTarget, FParams.TlsVerifyPeer);
+  end;
+
+  Handshake; // antes de qualquer thread (agora sobre TLS, se habilitado)
 
   FLastWriteTick := TThread.GetTickCount64;
   FLastReadTick := FLastWriteTick;
@@ -1046,6 +1135,9 @@ begin
   FRpcEvent := TEvent.Create(nil, True, False, '');
   FConsumers := TDictionary<string, TAMQPConsumerCallback>.Create;
   FConsumersLock := TCriticalSection.Create;
+  FConfirmMon := TObject.Create;
+  FUnconfirmed := TDictionary<UInt64, Boolean>.Create;
+  FNacked := TDictionary<UInt64, Boolean>.Create;
   FRecovery := TList<TAMQPRecoveryAction>.Create;
   FRecoveryLock := TCriticalSection.Create;
   FAsmState := asIdle;
@@ -1061,6 +1153,9 @@ begin
   DrainInFlight; // garante que nenhum callback ainda usa este canal
   FRecovery.Free;
   FRecoveryLock.Free;
+  FUnconfirmed.Free;
+  FNacked.Free;
+  FConfirmMon.Free;
   FConsumers.Free;
   FConsumersLock.Free;
   FRpcEvent.Free;
@@ -1113,6 +1208,18 @@ begin
   try
     FClosed := False;
     FAsmState := asIdle;
+    // Sessão nova: seq-no reinicia em 0 (o confirm.select é replayado abaixo, e
+    // o broker também reinicia a numeração). Publishes não confirmados antes da
+    // queda já foram reportados como não confirmados por FailAllUnconfirmed.
+    System.TMonitor.Enter(FConfirmMon);
+    try
+      FPublishSeqNo := 0;
+      FUnconfirmed.Clear;
+      FNacked.Clear;
+      System.TMonitor.PulseAll(FConfirmMon);
+    finally
+      System.TMonitor.Exit(FConfirmMon);
+    end;
     Open; // Channel.Open no novo socket (define FIsOpen := True)
 
     FConsumersLock.Enter;
@@ -1196,6 +1303,7 @@ begin
   FRpcError := AMessage;
   FRpcKind := rkError;
   FRpcEvent.SetEvent;
+  FailAllUnconfirmed; // publishes pendentes viram "não confirmados"
 end;
 
 procedure TAMQPChannel.Open;
@@ -1263,8 +1371,8 @@ begin
   AddRecovery(LPayload, not ABind.NoWait);
 end;
 
-procedure TAMQPChannel.Publish(const AExchange, ARoutingKey: string;
-  const ABody: TBytes; const AProps: TAMQPBasicProperties; AMandatory: Boolean);
+function TAMQPChannel.Publish(const AExchange, ARoutingKey: string;
+  const ABody: TBytes; const AProps: TAMQPBasicProperties; AMandatory: Boolean): UInt64;
 var
   LMaxBody, LOffset, LLen: Integer;
 begin
@@ -1275,10 +1383,27 @@ begin
   if LMaxBody < 1 then
     LMaxBody := 1;
 
+  Result := 0;
   // Os frames de uma mensagem (método + header + body) devem sair juntos, sem
   // que frames de outra thread se intercalem — por isso, um único lock.
   FConnection.FWriteLock.Enter;
   try
+    if FConfirmMode then
+    begin
+      // O seq-no acompanha a ordem de envio no wire: atribuído sob o FWriteLock,
+      // que serializa os publishes. Registramos a pendência ANTES de enviar
+      // (via FConfirmMon, o lock mais interno) para nunca perder um ack que
+      // chegue rápido demais — o padrão de registrar o consumer antes do Consume.
+      System.TMonitor.Enter(FConfirmMon);
+      try
+        Inc(FPublishSeqNo);
+        Result := FPublishSeqNo;
+        FUnconfirmed.AddOrSetValue(Result, True);
+      finally
+        System.TMonitor.Exit(FConfirmMon);
+      end;
+    end;
+
     FConnection.SendFrameNoLock(AMQP_FRAME_METHOD, FChannelId,
       BuildBasicPublish(AExchange, ARoutingKey, AMandatory, False));
     FConnection.SendFrameNoLock(AMQP_FRAME_HEADER, FChannelId,
@@ -1300,8 +1425,8 @@ begin
   end;
 end;
 
-procedure TAMQPChannel.PublishText(const AExchange, ARoutingKey, AText: string;
-  APersistent: Boolean);
+function TAMQPChannel.PublishText(const AExchange, ARoutingKey, AText: string;
+  APersistent: Boolean): UInt64;
 var
   LProps: TAMQPBasicProperties;
 begin
@@ -1309,7 +1434,7 @@ begin
   LProps.SetContentType('text/plain');
   if APersistent then
     LProps.SetPersistent;
-  Publish(AExchange, ARoutingKey, TEncoding.UTF8.GetBytes(AText), LProps);
+  Result := Publish(AExchange, ARoutingKey, TEncoding.UTF8.GetBytes(AText), LProps);
 end;
 
 function TAMQPChannel.BasicGet(const AQueue: string; ANoAck: Boolean): TAMQPGetResult;
@@ -1350,6 +1475,85 @@ end;
 procedure TAMQPChannel.Nack(ADeliveryTag: UInt64; ARequeue, AMultiple: Boolean);
 begin
   FConnection.SendMethod(FChannelId, BuildBasicNack(ADeliveryTag, AMultiple, ARequeue));
+end;
+
+procedure TAMQPChannel.ConfirmSelect;
+begin
+  if FConfirmMode then
+    Exit;
+  CallRpc(BuildConfirmSelect(False)); // Confirm.Select-Ok (sem args)
+  System.TMonitor.Enter(FConfirmMon);
+  try
+    FUnconfirmed.Clear;
+    FNacked.Clear;
+    FPublishSeqNo := 0; // primeiro publish daqui em diante recebe o seq-no 1
+  finally
+    System.TMonitor.Exit(FConfirmMon);
+  end;
+  FConfirmMode := True; // por último: a partir daqui Publish passa a numerar
+  AddRecovery(BuildConfirmSelect(False), True); // re-arma o confirm mode na reconexão
+end;
+
+function TAMQPChannel.WaitForConfirm(ASeqNo: UInt64; ATimeoutMs: Cardinal): Boolean;
+var
+  LDeadline, LNow: UInt64;
+  LRemaining: Int64;
+begin
+  if not FConfirmMode then
+    raise EAMQPChannel.Create('canal não está em modo confirm (chame ConfirmSelect)');
+  if ASeqNo = 0 then
+    raise EAMQPChannel.Create('seq-no inválido (0) em WaitForConfirm');
+  LDeadline := TThread.GetTickCount64 + ATimeoutMs;
+  System.TMonitor.Enter(FConfirmMon);
+  try
+    while True do
+    begin
+      if FNacked.ContainsKey(ASeqNo) then
+      begin
+        FNacked.Remove(ASeqNo);
+        Exit(False); // nack-ado (ou perdido numa queda de conexão)
+      end;
+      if not FUnconfirmed.ContainsKey(ASeqNo) then
+        // não está pendente nem nack-ado: ack-ado (se já foi publicado) ou
+        // seq-no que nunca existiu (> último atribuído => False, não espera à toa).
+        Exit(ASeqNo <= FPublishSeqNo);
+      LNow := TThread.GetTickCount64;
+      if LNow >= LDeadline then
+        Exit(False);
+      LRemaining := Int64(LDeadline) - Int64(LNow);
+      System.TMonitor.Wait(FConfirmMon, Cardinal(LRemaining));
+    end;
+  finally
+    System.TMonitor.Exit(FConfirmMon);
+  end;
+end;
+
+function TAMQPChannel.WaitForConfirms(ATimeoutMs: Cardinal): Boolean;
+var
+  LDeadline, LNow: UInt64;
+  LRemaining: Int64;
+begin
+  if not FConfirmMode then
+    raise EAMQPChannel.Create('canal não está em modo confirm (chame ConfirmSelect)');
+  LDeadline := TThread.GetTickCount64 + ATimeoutMs;
+  System.TMonitor.Enter(FConfirmMon);
+  try
+    while FUnconfirmed.Count > 0 do
+    begin
+      LNow := TThread.GetTickCount64;
+      if LNow >= LDeadline then
+        Exit(False);
+      LRemaining := Int64(LDeadline) - Int64(LNow);
+      System.TMonitor.Wait(FConfirmMon, Cardinal(LRemaining));
+    end;
+    // Todos os pendentes resolveram: sucesso sse NENHUM foi nack-ado. FNacked
+    // guarda os nacks ainda não consumidos — inclusive os que chegaram ANTES
+    // desta chamada. Ao limpar, consumimos o resultado deste lote.
+    Result := FNacked.Count = 0;
+    FNacked.Clear;
+  finally
+    System.TMonitor.Exit(FConfirmMon);
+  end;
 end;
 
 procedure TAMQPChannel.Qos(APrefetchCount: Word; AGlobal: Boolean);
@@ -1500,6 +1704,77 @@ begin
     end);
 end;
 
+procedure TAMQPChannel.DispatchConfirm(ASeqNo: UInt64; AAck: Boolean);
+var
+  LCallback: TAMQPConfirmCallback;
+begin
+  LCallback := FOnConfirm;
+  if not Assigned(LCallback) then
+    Exit;
+  // Despacha para o pool nativo; a thread de leitura NÃO roda o callback.
+  TInterlocked.Increment(FInFlight);
+  TTask.Run(
+    procedure
+    begin
+      try
+        LCallback(Self, ASeqNo, AAck);
+      finally
+        TInterlocked.Decrement(FInFlight);
+      end;
+    end);
+end;
+
+function TAMQPChannel.ResolveConfirms(ATag: UInt64;
+  AMultiple, AAck: Boolean): TArray<UInt64>;
+var
+  LList: TList<UInt64>;
+  LKey: UInt64;
+begin
+  // Roda na thread de leitura. `multiple` cobre "este e todos os anteriores
+  // ainda pendentes", então resolvemos todo seq-no <= tag.
+  LList := TList<UInt64>.Create;
+  try
+    System.TMonitor.Enter(FConfirmMon);
+    try
+      for LKey in FUnconfirmed.Keys do
+        if (AMultiple and (LKey <= ATag)) or (LKey = ATag) then
+          LList.Add(LKey);
+      for LKey in LList do
+      begin
+        FUnconfirmed.Remove(LKey);
+        if not AAck then
+          FNacked.AddOrSetValue(LKey, True);
+      end;
+      System.TMonitor.PulseAll(FConfirmMon); // acorda WaitForConfirm(s)
+    finally
+      System.TMonitor.Exit(FConfirmMon);
+    end;
+    Result := LList.ToArray;
+  finally
+    LList.Free;
+  end;
+end;
+
+procedure TAMQPChannel.FailAllUnconfirmed;
+var
+  LKey: UInt64;
+begin
+  // Chamado quando a conexão cai (SignalError): publishes pendentes ficam em
+  // estado ambíguo — reportamos como não confirmados (WaitForConfirm => False).
+  // NÃO dispara OnConfirm (que é só para confirmações reais do broker).
+  if not FConfirmMode then
+    Exit;
+  System.TMonitor.Enter(FConfirmMon);
+  try
+    for LKey in FUnconfirmed.Keys do
+      FNacked.AddOrSetValue(LKey, True);
+    FUnconfirmed.Clear;
+    System.TMonitor.PulseAll(FConfirmMon);
+  finally
+    System.TMonitor.Exit(FConfirmMon);
+  end;
+end;
+
 procedure TAMQPChannel.DrainInFlight;
 begin
   // Espera SEM timeout: liberar o canal com um callback ainda em execução seria
@@ -1579,6 +1854,10 @@ var
   LClose: TAMQPCloseInfo;
   LHeader: TAMQPContentHeader;
   LTag: string;
+  LAck: TAMQPBasicAck;
+  LNack: TAMQPBasicNack;
+  LResolved: TArray<UInt64>;
+  LSeq: UInt64;
 begin
   case FAsmState of
     asHeader:
@@ -1654,6 +1933,23 @@ begin
         FConsumersLock.Leave;
       end;
       RemoveConsumerRecovery(LTag);
+    end
+    else if LId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_ACK) then
+    begin
+      // publisher confirm: ack de um ou mais publishes (frame de método puro,
+      // sem content). Resolve os pendentes e despacha OnConfirm fora do lock.
+      LAck := DecodeBasicAck(LReader);
+      LResolved := ResolveConfirms(LAck.DeliveryTag, LAck.Multiple, True);
+      for LSeq in LResolved do
+        DispatchConfirm(LSeq, True);
+    end
+    else if LId.Matches(AMQP_CLASS_BASIC, AMQP_BASIC_NACK) then
+    begin
+      // publisher confirm: nack (o broker não conseguiu cuidar do publish).
+      LNack := DecodeBasicNack(LReader);
+      LResolved := ResolveConfirms(LNack.DeliveryTag, LNack.Multiple, False);
+      for LSeq in LResolved do
+        DispatchConfirm(LSeq, False);
     end
     else if LId.Matches(AMQP_CLASS_CHANNEL, AMQP_CHANNEL_CLOSE) then
     begin

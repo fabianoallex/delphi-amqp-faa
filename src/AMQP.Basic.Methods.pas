@@ -112,6 +112,22 @@ type
     RoutingKey: string;
   end;
 
+  { Confirmação de publish enviada pelo broker no modo `confirm` (publisher
+    confirms). O broker reusa Basic.Ack/Basic.Nack (mesmos IDs de método que o
+    cliente usa para confirmar consumo), mas aqui DeliveryTag é o seq-no do
+    publish e Multiple significa "este e todos os anteriores ainda pendentes".
+    São frames de método puros — sem content header nem body. }
+  TAMQPBasicAck = record
+    DeliveryTag: UInt64;
+    Multiple: Boolean;
+  end;
+
+  TAMQPBasicNack = record
+    DeliveryTag: UInt64;
+    Multiple: Boolean;
+    Requeue: Boolean;    // sem uso prático em confirms; presente por simetria
+  end;
+
 function BuildBasicPublish(const AExchange, ARoutingKey: string;
   AMandatory: Boolean = False; AImmediate: Boolean = False): TBytes;
 
@@ -121,6 +137,14 @@ function DecodeBasicGetOk(const AReader: TAMQPReader): TAMQPBasicGetOk;
 function BuildBasicAck(ADeliveryTag: UInt64; AMultiple: Boolean = False): TBytes;
 function BuildBasicNack(ADeliveryTag: UInt64; AMultiple: Boolean = False;
   ARequeue: Boolean = True): TBytes;
+
+/// Decodifica um Basic.Ack/Basic.Nack vindo do broker (publisher confirms).
+/// O cabeçalho de método (class/method) já deve ter sido lido do reader.
+function DecodeBasicAck(const AReader: TAMQPReader): TAMQPBasicAck;
+function DecodeBasicNack(const AReader: TAMQPReader): TAMQPBasicNack;
+
+/// Confirm.Select (classe 85): coloca o canal em modo publisher confirms.
+function BuildConfirmSelect(ANoWait: Boolean = False): TBytes;
 
 function BuildBasicQos(APrefetchCount: Word; AGlobal: Boolean = False;
   APrefetchSize: Cardinal = 0): TBytes;
@@ -320,6 +344,32 @@ begin
     W.WriteLongLongUInt(ADeliveryTag);
     W.WriteBit(AMultiple);
     W.WriteBit(ARequeue);
+    Result := W.ToBytes;
+  finally
+    W.Free;
+  end;
+end;
+
+function DecodeBasicAck(const AReader: TAMQPReader): TAMQPBasicAck;
+begin
+  Result.DeliveryTag := AReader.ReadLongLongUInt;
+  Result.Multiple := AReader.ReadBit;
+end;
+
+function DecodeBasicNack(const AReader: TAMQPReader): TAMQPBasicNack;
+begin
+  Result.DeliveryTag := AReader.ReadLongLongUInt;
+  Result.Multiple := AReader.ReadBit;
+  Result.Requeue := AReader.ReadBit;
+end;
+
+function BuildConfirmSelect(ANoWait: Boolean): TBytes;
+var
+  W: TAMQPWriter;
+begin
+  W := BeginMethod(AMQP_CLASS_CONFIRM, AMQP_CONFIRM_SELECT);
+  try
+    W.WriteBit(ANoWait);
     Result := W.ToBytes;
   finally
     W.Free;
