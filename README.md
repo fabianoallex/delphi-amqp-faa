@@ -180,6 +180,14 @@ Se a conexão cair antes da confirmação, o publish pendente é reportado como
 para confirmações reais do broker. Após uma reconexão a numeração de seq-no
 reinicia (canal novo) — ver *Limitações conhecidas*.
 
+**Reenvio automático (opt-in)**: com `RepublishUnconfirmedOnReconnect := True` nos
+parâmetros da conexão (junto de `AutoReconnect`), os publishes que ficaram sem
+confirmação numa queda são **re-publicados automaticamente na reconexão**, com
+seq-nos novos (observáveis via `OnConfirm`). É *at-least-once* — pode haver
+duplicatas quando o broker recebeu a mensagem mas o `ack` se perdeu na queda; os
+seq-nos originais seguem reportando "não confirmado". Custo: guarda o corpo de
+cada publish pendente até a confirmação.
+
 Para saber se um publish `mandatory` não foi roteado a nenhuma fila, trate
 `OnBasicReturn` (dispara numa thread do pool, como o callback de consumer):
 

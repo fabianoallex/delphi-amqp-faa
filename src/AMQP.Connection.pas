@@ -77,6 +77,10 @@ type
     ReconnectDelayMs: Cardinal;    // espera entre tentativas (padrão 2000)
     MaxReconnectAttempts: Integer; // 0 = infinitas
     ConnectionName: string;        // opcional; vai em client-properties
+    // Reenvio automático (opt-in): em confirm mode, publishes deixados sem
+    // confirmação por uma queda são re-publicados na reconexão (novos seq-nos).
+    // At-least-once — pode duplicar. Custo: guarda o corpo até confirmar.
+    RepublishUnconfirmedOnReconnect: Boolean;
     // TLS (amqps://) via SChannel nativo. Opt-in.
     UseTls: Boolean;               // True => faz handshake TLS antes do AMQP
     TlsVerifyPeer: Boolean;        // True (padrão): valida cadeia + hostname
@@ -173,6 +177,15 @@ type
 
   TAMQPRpcKind = (rkNone, rkMethod, rkMessage, rkError);
 
+  { Frames já serializados de um publish, guardados para reenvio após reconexão
+    (uso interno; ver RepublishUnconfirmedOnReconnect). Method/Header são os
+    payloads dos frames; Body é o corpo completo (refatiado no reenvio). }
+  TAMQPRawPublish = record
+    Method: TBytes;
+    Header: TBytes;
+    Body: TBytes;
+  end;
+
   { Canal de dados. Criado via TAMQPConnection.CreateChannel (que já o abre).
     O chamador é dono do canal e deve liberá-lo (Free). }
   TAMQPChannel = class
@@ -215,6 +228,11 @@ type
     FUnconfirmed: TDictionary<UInt64, Boolean>; // seq-nos aguardando confirmação
     FNacked: TDictionary<UInt64, Boolean>;      // seq-nos nack-ados (ou perdidos na queda)
     FOnConfirm: TAMQPConfirmCallback;
+    // Reenvio automático (opt-in via params): buffer do conteúdo dos publishes
+    // pendentes, por seq-no, para re-publicar após reconexão. Protegido pelo
+    // FConfirmMon, como FUnconfirmed.
+    FRepublish: Boolean;
+    FResendBuffer: TDictionary<UInt64, TAMQPRawPublish>;
     // --- topologia gravada para reconexão ---
     FRecovery: TList<TAMQPRecoveryAction>;
     FRecoveryLock: TCriticalSection;
@@ -254,6 +272,14 @@ type
     function ResolveConfirms(ATag: UInt64; AMultiple, AAck: Boolean): TArray<UInt64>;
     /// Marca todos os publishes pendentes como não confirmados (queda de conexão).
     procedure FailAllUnconfirmed;
+    /// Envia os frames de um publish sob FWriteLock, atribuindo o seq-no (em
+    /// confirm mode) e bufferizando para reenvio (se habilitado). Base de Publish
+    /// e do reenvio pós-reconexão. Devolve o seq-no (0 fora do confirm mode).
+    function DoSendPublish(const AMethod, AHeader, ABody: TBytes): UInt64;
+    /// Re-publica os publishes que ficaram sem confirmação (chamado no Recover,
+    /// se RepublishUnconfirmedOnReconnect). Reenvia na ordem original, com seq-nos
+    /// novos; os antigos já foram reportados como não confirmados.
+    procedure ResendUnconfirmed;
     /// Aguarda os callbacks em voo terminarem (usado ao fechar o canal).
     procedure DrainInFlight;
     /// Trata um frame entregue pela thread de leitura (roda NA thread de leitura).
@@ -514,6 +540,7 @@ begin
   Result.ReconnectDelayMs := 2000;
   Result.MaxReconnectAttempts := 0; // infinitas
   Result.ConnectionName := '';
+  Result.RepublishUnconfirmedOnReconnect := False;
   Result.UseTls := False;
   Result.TlsVerifyPeer := True;
   Result.TlsServerName := '';
@@ -1233,6 +1260,8 @@ begin
   FConfirmMon := TObject.Create;
   FUnconfirmed := TDictionary<UInt64, Boolean>.Create;
   FNacked := TDictionary<UInt64, Boolean>.Create;
+  FResendBuffer := TDictionary<UInt64, TAMQPRawPublish>.Create;
+  FRepublish := AConnection.FParams.RepublishUnconfirmedOnReconnect;
   FRecovery := TList<TAMQPRecoveryAction>.Create;
   FRecoveryLock := TCriticalSection.Create;
   FAsmState := asIdle;
@@ -1250,6 +1279,7 @@ begin
   FRecoveryLock.Free;
   FUnconfirmed.Free;
   FNacked.Free;
+  FResendBuffer.Free;
   FConfirmMon.Free;
   FConsumers.Free;
   FConsumersLock.Free;
@@ -1410,6 +1440,10 @@ begin
       else
         FConnection.SendMethod(FChannelId, LAction.Payload);
     end;
+
+    // Topologia restaurada e confirm mode re-armado (via replay do confirm.select):
+    // re-publica o que ficou sem confirmação na queda (se habilitado).
+    ResendUnconfirmed;
   finally
     FRpcLock.Leave;
   end;
@@ -1559,10 +1593,10 @@ begin
   RemoveExchangeBindRecovery(AUnbind.Destination, AUnbind.Source, AUnbind.RoutingKey);
 end;
 
-function TAMQPChannel.Publish(const AExchange, ARoutingKey: string;
-  const ABody: TBytes; const AProps: TAMQPBasicProperties; AMandatory: Boolean): UInt64;
+function TAMQPChannel.DoSendPublish(const AMethod, AHeader, ABody: TBytes): UInt64;
 var
   LMaxBody, LOffset, LLen: Integer;
+  LRaw: TAMQPRawPublish;
 begin
   if FConnection.FNegotiated.FrameMax = 0 then
     LMaxBody := 131072 - 8
@@ -1587,15 +1621,22 @@ begin
         Inc(FPublishSeqNo);
         Result := FPublishSeqNo;
         FUnconfirmed.AddOrSetValue(Result, True);
+        if FRepublish then
+        begin
+          // Guarda o conteúdo para reenvio se a conexão cair antes do ack. Copy
+          // do corpo: o chamador pode reutilizar/liberar o array após retornar.
+          LRaw.Method := AMethod;
+          LRaw.Header := AHeader;
+          LRaw.Body := Copy(ABody, 0, Length(ABody));
+          FResendBuffer.AddOrSetValue(Result, LRaw);
+        end;
       finally
         System.TMonitor.Exit(FConfirmMon);
       end;
     end;
 
-    FConnection.SendFrameNoLock(AMQP_FRAME_METHOD, FChannelId,
-      BuildBasicPublish(AExchange, ARoutingKey, AMandatory, False));
-    FConnection.SendFrameNoLock(AMQP_FRAME_HEADER, FChannelId,
-      BuildContentHeader(UInt64(Length(ABody)), AProps));
+    FConnection.SendFrameNoLock(AMQP_FRAME_METHOD, FChannelId, AMethod);
+    FConnection.SendFrameNoLock(AMQP_FRAME_HEADER, FChannelId, AHeader);
 
     LOffset := 0;
     while LOffset < Length(ABody) do
@@ -1611,6 +1652,44 @@ begin
   finally
     FConnection.FWriteLock.Leave;
   end;
+end;
+
+function TAMQPChannel.Publish(const AExchange, ARoutingKey: string;
+  const ABody: TBytes; const AProps: TAMQPBasicProperties; AMandatory: Boolean): UInt64;
+begin
+  Result := DoSendPublish(
+    BuildBasicPublish(AExchange, ARoutingKey, AMandatory, False),
+    BuildContentHeader(UInt64(Length(ABody)), AProps),
+    ABody);
+end;
+
+procedure TAMQPChannel.ResendUnconfirmed;
+var
+  LKeys: TArray<UInt64>;
+  LSnapshot: TArray<TAMQPRawPublish>;
+  I: Integer;
+begin
+  if not (FConfirmMode and FRepublish) then
+    Exit;
+  // Tira um snapshot ordenado (ordem original de publicação) e limpa o buffer
+  // sob o lock; reenvia FORA do lock (DoSendPublish re-adquire FWriteLock/FConfirmMon
+  // e re-bufferiza sob os novos seq-nos).
+  System.TMonitor.Enter(FConfirmMon);
+  try
+    LKeys := FResendBuffer.Keys.ToArray;
+    if Length(LKeys) = 0 then
+      Exit;
+    TArray.Sort<UInt64>(LKeys);
+    SetLength(LSnapshot, Length(LKeys));
+    for I := 0 to High(LKeys) do
+      LSnapshot[I] := FResendBuffer[LKeys[I]];
+    FResendBuffer.Clear;
+  finally
+    System.TMonitor.Exit(FConfirmMon);
+  end;
+
+  for I := 0 to High(LSnapshot) do
+    DoSendPublish(LSnapshot[I].Method, LSnapshot[I].Header, LSnapshot[I].Body);
 end;
 
 function TAMQPChannel.PublishText(const AExchange, ARoutingKey, AText: string;
@@ -1674,6 +1753,7 @@ begin
   try
     FUnconfirmed.Clear;
     FNacked.Clear;
+    FResendBuffer.Clear;
     FPublishSeqNo := 0; // primeiro publish daqui em diante recebe o seq-no 1
     FConfirmBase := 0;
   finally
@@ -1934,6 +2014,7 @@ begin
       for LKey in LList do
       begin
         FUnconfirmed.Remove(LKey);
+        FResendBuffer.Remove(LKey); // confirmado (ack ou nack do broker): não reenvia
         if not AAck then
           FNacked.AddOrSetValue(LKey, True);
       end;

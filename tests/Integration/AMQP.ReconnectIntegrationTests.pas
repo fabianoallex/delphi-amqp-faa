@@ -36,6 +36,7 @@ type
 
     [Test] procedure Reconecta_E_ContinuaConsumindo;
     [Test] procedure Confirm_PerdaNaQueda_WaitForConfirmsRetornaFalse;
+    [Test] procedure Confirm_Republish_ReenviaNaoConfirmadosAposQueda;
   end;
 
 implementation
@@ -202,6 +203,81 @@ begin
       'WaitForConfirms deve reportar False para publishes perdidos na queda');
   finally
     LConn.Free;
+  end;
+end;
+
+procedure TAMQPReconnectIntegrationTests.Confirm_Republish_ReenviaNaoConfirmadosAposQueda;
+var
+  LPubParams: TAMQPConnectionParams;
+  LPubConn: TAMQPConnection;
+  LPubChan: TAMQPChannel;
+  LCtrlChan: TAMQPChannel;
+  LDecl: TAMQPQueueDeclare;
+  LQueue: string;
+  LReconnected, I, LWaited, LCount: Integer;
+  LGet: TAMQPGetResult;
+begin
+  // A fila é declarada pela conexão de CONTROLE do Setup (FControlConn), exclusiva
+  // dela — some no teardown. Como não pertence à conexão publicadora, sobrevive à
+  // queda dela e acumula as mensagens (o publisher publica via exchange padrão).
+  LCtrlChan := FControlChan;
+  LDecl := Default(TAMQPQueueDeclare);
+  LDecl.Exclusive := True;
+  LQueue := LCtrlChan.DeclareQueue(LDecl).QueueName;
+
+  // Conexão publicadora: auto-reconnect + reenvio de não confirmados.
+  LReconnected := 0;
+  LPubParams := TAMQPConnectionParams.Localhost;
+  LPubParams.AutoReconnect := True;
+  LPubParams.ReconnectDelayMs := 500;
+  LPubParams.RepublishUnconfirmedOnReconnect := True;
+  LPubConn := TAMQPConnection.Create(LPubParams);
+  try
+    LPubConn.OnReconnect :=
+      procedure(AConnection: TAMQPConnection)
+      begin
+        TInterlocked.Exchange(LReconnected, 1);
+      end;
+    LPubConn.Open;
+    LPubChan := LPubConn.CreateChannel;
+    LPubChan.ConfirmSelect;
+
+    // Publica um lote e derruba IMEDIATAMENTE: a maioria fica sem confirmação e
+    // depende do reenvio para chegar à fila.
+    for I := 1 to 100 do
+      LPubChan.PublishText('', LQueue, 'msg-' + IntToStr(I));
+    LPubConn.DropConnectionForTest;
+
+    // Aguarda a reconexão (que dispara o reenvio dos não confirmados).
+    LWaited := 0;
+    while (TInterlocked.CompareExchange(LReconnected, 0, 0) = 0) and (LWaited < 15000) do
+    begin
+      TThread.Sleep(50);
+      Inc(LWaited, 50);
+    end;
+    Assert.AreEqual(1, TInterlocked.CompareExchange(LReconnected, 0, 0),
+      'deveria ter reconectado');
+
+    // Drena pela conexão de controle: as 100 devem chegar (at-least-once — pode
+    // haver duplicatas de mensagens cujo ack se perdeu na queda, por isso >= 100).
+    LCount := 0;
+    LWaited := 0;
+    while (LCount < 100) and (LWaited < 10000) do
+    begin
+      LGet := LCtrlChan.BasicGet(LQueue, True);
+      if LGet.Found then
+        Inc(LCount)
+      else
+      begin
+        TThread.Sleep(50);
+        Inc(LWaited, 50);
+      end;
+    end;
+    Assert.IsTrue(LCount >= 100,
+      Format('reenvio deveria entregar >= 100 msgs; entregou %d', [LCount]));
+  finally
+    LPubChan.Free;
+    LPubConn.Free;
   end;
 end;
 
