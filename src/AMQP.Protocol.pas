@@ -76,6 +76,13 @@ const
   AMQP_EXCHANGE_DECLARE_OK  = 11;
   AMQP_EXCHANGE_DELETE     = 20;
   AMQP_EXCHANGE_DELETE_OK   = 21;
+  /// Binding exchange->exchange (extensao RabbitMQ 'exchange_exchange_bindings',
+  /// nao faz parte do 0-9-1 core). Nota: unbind-ok e' 51 (nao 41), por
+  /// peculiaridade da spec estendida da RabbitMQ.
+  AMQP_EXCHANGE_BIND       = 30;
+  AMQP_EXCHANGE_BIND_OK     = 31;
+  AMQP_EXCHANGE_UNBIND     = 40;
+  AMQP_EXCHANGE_UNBIND_OK   = 51;
 
   // --- Metodos de Queue (classe 50) ---------------------------------------
   AMQP_QUEUE_DECLARE    = 10;

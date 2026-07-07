@@ -38,11 +38,28 @@ type
     NoWait: Boolean;
   end;
 
+  { Binding exchange->exchange (extensão RabbitMQ). Destination recebe as
+    mensagens roteadas de Source pela RoutingKey. Serve tanto para bind quanto
+    para unbind (mesmo layout de argumentos). }
+  TAMQPExchangeBinding = record
+    Destination: string;         // exchange que recebe (destino)
+    Source: string;              // exchange de origem
+    RoutingKey: string;
+    NoWait: Boolean;
+    Arguments: TAMQPFieldTable;  // pode ser nil
+  end;
+
 function BuildExchangeDeclare(const ADeclare: TAMQPExchangeDeclare): TBytes;
 procedure DecodeExchangeDeclareOk(const AReader: TAMQPReader);
 
 function BuildExchangeDelete(const ADelete: TAMQPExchangeDelete): TBytes;
 procedure DecodeExchangeDeleteOk(const AReader: TAMQPReader);
+
+function BuildExchangeBind(const ABind: TAMQPExchangeBinding): TBytes;
+procedure DecodeExchangeBindOk(const AReader: TAMQPReader);
+
+function BuildExchangeUnbind(const AUnbind: TAMQPExchangeBinding): TBytes;
+procedure DecodeExchangeUnbindOk(const AReader: TAMQPReader);
 
 implementation
 
@@ -100,6 +117,47 @@ begin
 end;
 
 procedure DecodeExchangeDeleteOk(const AReader: TAMQPReader);
+begin
+  // sem argumentos
+end;
+
+// exchange.bind e exchange.unbind têm o MESMO layout de argumentos
+// (reserved-1, destination, source, routing-key, no-wait, arguments).
+function BuildExchangeBindLike(AMethodId: Word;
+  const ABinding: TAMQPExchangeBinding): TBytes;
+var
+  W: TAMQPWriter;
+begin
+  W := BeginMethod(AMQP_CLASS_EXCHANGE, AMethodId);
+  try
+    W.WriteShortUInt(0); // reserved-1
+    W.WriteShortStr(ABinding.Destination);
+    W.WriteShortStr(ABinding.Source);
+    W.WriteShortStr(ABinding.RoutingKey);
+    W.WriteBit(ABinding.NoWait);
+    W.WriteFieldTable(ABinding.Arguments);
+    Result := W.ToBytes;
+  finally
+    W.Free;
+  end;
+end;
+
+function BuildExchangeBind(const ABind: TAMQPExchangeBinding): TBytes;
+begin
+  Result := BuildExchangeBindLike(AMQP_EXCHANGE_BIND, ABind);
+end;
+
+procedure DecodeExchangeBindOk(const AReader: TAMQPReader);
+begin
+  // sem argumentos
+end;
+
+function BuildExchangeUnbind(const AUnbind: TAMQPExchangeBinding): TBytes;
+begin
+  Result := BuildExchangeBindLike(AMQP_EXCHANGE_UNBIND, AUnbind);
+end;
+
+procedure DecodeExchangeUnbindOk(const AReader: TAMQPReader);
 begin
   // sem argumentos
 end;

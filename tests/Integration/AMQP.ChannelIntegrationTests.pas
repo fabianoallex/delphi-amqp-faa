@@ -34,6 +34,7 @@ type
     [Test] procedure GetEmpty_QuandoFilaVazia;
     [Test] procedure DeclareQueue_RetornaNomeGerado;
     [Test] procedure Unbind_ParaDeRotearParaAFila;
+    [Test] procedure ExchangeBind_RoteiaSourceParaDest;
     [Test] procedure PublishMandatory_SemRota_DisparaOnBasicReturn;
     [Test] procedure Confirm_PublishRoteavel_Ackado;
     [Test] procedure Confirm_WaitForConfirms_VariosPublishes;
@@ -181,6 +182,50 @@ begin
   TThread.Sleep(200); // dá tempo de o broker rotear (ou descartar)
   LResult := FChan.BasicGet(LQueue, True);
   Assert.IsFalse(LResult.Found, 'após o unbind, a fila não deveria mais receber');
+end;
+
+procedure TAMQPChannelIntegrationTests.ExchangeBind_RoteiaSourceParaDest;
+var
+  LSource, LDest, LQueue, LRk: string;
+  LEx: TAMQPExchangeDeclare;
+  LQBind: TAMQPQueueBind;
+  LEBind: TAMQPExchangeBinding;
+  LResult: TAMQPGetResult;
+begin
+  // source (direct) --[rk]--> dest (fanout) --> fila. Exchanges auto-delete: como
+  // os bindings existem durante todo o teste, elas sobrevivem; no teardown a fila
+  // exclusiva some -> dest perde o binding -> some -> source perde o binding ->
+  // some (cascata limpa, sem lixo no broker e sem publicar em exchange apagada).
+  LRk := 'rota.ex';
+  LSource := 'test-exsrc-' + TGUID.NewGuid.ToString;
+  LDest := 'test-exdst-' + TGUID.NewGuid.ToString;
+
+  LEx := TAMQPExchangeDeclare.Create(LSource, AMQP_EXCHANGE_TYPE_DIRECT, False);
+  LEx.AutoDelete := True;
+  FChan.DeclareExchange(LEx);
+
+  LEx := TAMQPExchangeDeclare.Create(LDest, AMQP_EXCHANGE_TYPE_FANOUT, False);
+  LEx.AutoDelete := True;
+  FChan.DeclareExchange(LEx);
+
+  LQueue := DeclareTempQueue;
+  LQBind := Default(TAMQPQueueBind);
+  LQBind.QueueName := LQueue;
+  LQBind.ExchangeName := LDest;
+  LQBind.RoutingKey := ''; // fanout ignora a routing-key
+  FChan.BindQueue(LQBind);
+
+  LEBind := Default(TAMQPExchangeBinding);
+  LEBind.Destination := LDest;
+  LEBind.Source := LSource;
+  LEBind.RoutingKey := LRk;
+  FChan.BindExchange(LEBind);
+
+  // Publica na source com a routing-key do binding: source -> dest -> fila.
+  FChan.PublishText(LSource, LRk, 'via-exchange-bind');
+  LResult := GetWithRetry(LQueue);
+  Assert.IsTrue(LResult.Found, 'a mensagem deveria rotear source->dest->fila');
+  Assert.AreEqual('via-exchange-bind', LResult.BodyAsText);
 end;
 
 procedure TAMQPChannelIntegrationTests.PublishMandatory_SemRota_DisparaOnBasicReturn;

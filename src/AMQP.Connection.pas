@@ -227,6 +227,10 @@ type
     /// para que um unbind não seja desfeito por uma reconexão. Casa binds sem
     /// Arguments (o caso comum), nas duas variantes de no-wait.
     procedure RemoveBindRecovery(const AQueue, AExchange, ARoutingKey: string);
+    /// Idem para bindings exchange->exchange (ver UnbindExchange).
+    procedure RemoveExchangeBindRecovery(const ADestination, ASource, ARoutingKey: string);
+    /// Remove do recovery toda ação cujo payload coincida com um dos candidatos.
+    procedure RemoveRecoveryMatching(const ACandidates: array of TBytes);
     /// Reabre o canal e replaya a topologia gravada (chamado na reconexão).
     procedure Recover;
     procedure Open;
@@ -266,6 +270,12 @@ type
     /// não ser recriado numa eventual reconexão (ver AddRecovery/Recover). Binds
     /// com Arguments não-triviais não são reconciliados automaticamente.
     procedure UnbindQueue(const AUnbind: TAMQPQueueUnbind);
+    /// Liga uma exchange a outra (binding exchange->exchange, extensão RabbitMQ):
+    /// Destination passa a receber o que for roteado de Source pela RoutingKey.
+    procedure BindExchange(const ABind: TAMQPExchangeBinding);
+    /// Desfaz um binding exchange->exchange e remove o bind equivalente da
+    /// topologia de recovery (mesma reconciliação de UnbindQueue).
+    procedure UnbindExchange(const AUnbind: TAMQPExchangeBinding);
 
     /// Coloca o canal em modo publisher confirms (confirm.select). A partir daí
     /// cada Publish recebe um seq-no e o broker o confirma via Basic.Ack/Nack —
@@ -1281,8 +1291,7 @@ begin
   end;
 end;
 
-procedure TAMQPChannel.RemoveBindRecovery(const AQueue, AExchange,
-  ARoutingKey: string);
+procedure TAMQPChannel.RemoveRecoveryMatching(const ACandidates: array of TBytes);
 
   function SameBytes(const A, B: TBytes): Boolean;
   begin
@@ -1291,9 +1300,27 @@ procedure TAMQPChannel.RemoveBindRecovery(const AQueue, AExchange,
   end;
 
 var
+  I, J: Integer;
+begin
+  FRecoveryLock.Enter;
+  try
+    for I := FRecovery.Count - 1 downto 0 do
+      for J := 0 to High(ACandidates) do
+        if SameBytes(FRecovery[I].Payload, ACandidates[J]) then
+        begin
+          FRecovery.Delete(I);
+          Break;
+        end;
+  finally
+    FRecoveryLock.Leave;
+  end;
+end;
+
+procedure TAMQPChannel.RemoveBindRecovery(const AQueue, AExchange,
+  ARoutingKey: string);
+var
   LBind: TAMQPQueueBind;
-  LCandNoWaitFalse, LCandNoWaitTrue: TBytes;
-  I: Integer;
+  LCandFalse, LCandTrue: TBytes;
 begin
   // O recovery guarda o payload serializado do bind; reconstruímos os candidatos
   // (nas duas variantes de no-wait, sem Arguments) e removemos os que casarem.
@@ -1302,19 +1329,27 @@ begin
   LBind.ExchangeName := AExchange;
   LBind.RoutingKey := ARoutingKey;
   LBind.NoWait := False;
-  LCandNoWaitFalse := BuildQueueBind(LBind);
+  LCandFalse := BuildQueueBind(LBind);
   LBind.NoWait := True;
-  LCandNoWaitTrue := BuildQueueBind(LBind);
+  LCandTrue := BuildQueueBind(LBind);
+  RemoveRecoveryMatching([LCandFalse, LCandTrue]);
+end;
 
-  FRecoveryLock.Enter;
-  try
-    for I := FRecovery.Count - 1 downto 0 do
-      if SameBytes(FRecovery[I].Payload, LCandNoWaitFalse) or
-         SameBytes(FRecovery[I].Payload, LCandNoWaitTrue) then
-        FRecovery.Delete(I);
-  finally
-    FRecoveryLock.Leave;
-  end;
+procedure TAMQPChannel.RemoveExchangeBindRecovery(const ADestination, ASource,
+  ARoutingKey: string);
+var
+  LBind: TAMQPExchangeBinding;
+  LCandFalse, LCandTrue: TBytes;
+begin
+  LBind := Default(TAMQPExchangeBinding);
+  LBind.Destination := ADestination;
+  LBind.Source := ASource;
+  LBind.RoutingKey := ARoutingKey;
+  LBind.NoWait := False;
+  LCandFalse := BuildExchangeBind(LBind);
+  LBind.NoWait := True;
+  LCandTrue := BuildExchangeBind(LBind);
+  RemoveRecoveryMatching([LCandFalse, LCandTrue]);
 end;
 
 procedure TAMQPChannel.Recover;
@@ -1498,6 +1533,30 @@ procedure TAMQPChannel.UnbindQueue(const AUnbind: TAMQPQueueUnbind);
 begin
   CallRpc(BuildQueueUnbind(AUnbind)); // Unbind-Ok (sem args, descartado)
   RemoveBindRecovery(AUnbind.QueueName, AUnbind.ExchangeName, AUnbind.RoutingKey);
+end;
+
+procedure TAMQPChannel.BindExchange(const ABind: TAMQPExchangeBinding);
+var
+  LPayload: TBytes;
+begin
+  LPayload := BuildExchangeBind(ABind);
+  if ABind.NoWait then
+    FConnection.SendMethod(FChannelId, LPayload)
+  else
+    CallRpc(LPayload); // Bind-Ok (sem args, descartado)
+  AddRecovery(LPayload, not ABind.NoWait);
+end;
+
+procedure TAMQPChannel.UnbindExchange(const AUnbind: TAMQPExchangeBinding);
+var
+  LPayload: TBytes;
+begin
+  LPayload := BuildExchangeUnbind(AUnbind);
+  if AUnbind.NoWait then
+    FConnection.SendMethod(FChannelId, LPayload)
+  else
+    CallRpc(LPayload); // Unbind-Ok (sem args, descartado)
+  RemoveExchangeBindRecovery(AUnbind.Destination, AUnbind.Source, AUnbind.RoutingKey);
 end;
 
 function TAMQPChannel.Publish(const AExchange, ARoutingKey: string;

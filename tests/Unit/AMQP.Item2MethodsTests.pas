@@ -24,6 +24,8 @@ type
     [Test] procedure ChannelOpen_RoundTrip;
     [Test] procedure ChannelClose_RoundTrip;
     [Test] procedure ExchangeDeclare_RoundTrip;
+    [Test] procedure ExchangeBind_RoundTrip;
+    [Test] procedure ExchangeUnbind_RoundTrip;
     [Test] procedure QueueDeclare_RoundTrip;
     [Test] procedure QueueDeclareOk_Decode;
     [Test] procedure QueueBind_RoundTrip;
@@ -119,6 +121,65 @@ begin
     Assert.IsTrue(R.ReadBit, 'durable');
     Assert.IsTrue(R.ReadBit, 'auto-delete');
     Assert.IsFalse(R.ReadBit, 'internal');
+    Assert.IsFalse(R.ReadBit, 'no-wait');
+  finally
+    R.Free;
+  end;
+end;
+
+procedure TChannelQueueExchangeTests.ExchangeBind_RoundTrip;
+var
+  LBind: TAMQPExchangeBinding;
+  R: TAMQPReader;
+  LId: TAMQPMethodId;
+  LArgs: TAMQPFieldTable;
+begin
+  LBind := Default(TAMQPExchangeBinding);
+  LBind.Destination := 'nfe.dest';
+  LBind.Source := 'nfe.source';
+  LBind.RoutingKey := 'resposta.*';
+
+  R := TAMQPReader.Create(BuildExchangeBind(LBind));
+  try
+    LId := ReadMethodHeader(R);
+    Assert.IsTrue(LId.Matches(AMQP_CLASS_EXCHANGE, AMQP_EXCHANGE_BIND));
+    Assert.AreEqual(Word(0), R.ReadShortUInt, 'reserved-1');
+    Assert.AreEqual('nfe.dest', R.ReadShortStr, 'destination');
+    Assert.AreEqual('nfe.source', R.ReadShortStr, 'source');
+    Assert.AreEqual('resposta.*', R.ReadShortStr, 'routing-key');
+    Assert.IsFalse(R.ReadBit, 'no-wait');
+    LArgs := R.ReadFieldTable;
+    try
+      Assert.AreEqual(0, LArgs.Count, 'arguments vazio');
+    finally
+      LArgs.Free;
+    end;
+    Assert.IsTrue(R.EndOfData);
+  finally
+    R.Free;
+  end;
+end;
+
+procedure TChannelQueueExchangeTests.ExchangeUnbind_RoundTrip;
+var
+  LUnbind: TAMQPExchangeBinding;
+  R: TAMQPReader;
+  LId: TAMQPMethodId;
+begin
+  LUnbind := Default(TAMQPExchangeBinding);
+  LUnbind.Destination := 'nfe.dest';
+  LUnbind.Source := 'nfe.source';
+  LUnbind.RoutingKey := 'resposta.*';
+
+  R := TAMQPReader.Create(BuildExchangeUnbind(LUnbind));
+  try
+    LId := ReadMethodHeader(R);
+    // Mesmo layout do bind, mas com o method-id de unbind (40).
+    Assert.IsTrue(LId.Matches(AMQP_CLASS_EXCHANGE, AMQP_EXCHANGE_UNBIND));
+    Assert.AreEqual(Word(0), R.ReadShortUInt, 'reserved-1');
+    Assert.AreEqual('nfe.dest', R.ReadShortStr, 'destination');
+    Assert.AreEqual('nfe.source', R.ReadShortStr, 'source');
+    Assert.AreEqual('resposta.*', R.ReadShortStr, 'routing-key');
     Assert.IsFalse(R.ReadBit, 'no-wait');
   finally
     R.Free;
