@@ -312,13 +312,60 @@ Abra `AMQP.groupproj` no RAD Studio.
 - Publisher confirms + reconexão: ao reconectar, o modo confirm é re-armado e os
   seq-nos devolvidos por `Publish` seguem **monotônicos** (não reiniciam). Os
   publishes não confirmados antes da queda são reportados como **não confirmados**
-  (`WaitForConfirm`/`WaitForConfirms` retornam `False`), porém **não reenviados
-  automaticamente** — reenvie na sua camada se precisar de garantia ponta a ponta.
-- A recuperação de topologia na reconexão assume filas **nomeadas**; filas com
-  nome gerado pelo servidor recebem um novo nome ao serem redeclaradas.
-- TLS é **só Windows** (SChannel). mTLS/client-cert, escolha manual de versão/
-  cipher suite e exposição de TLS no adapter de `delphi-api-infra-faa` ainda não
-  estão implementados.
+  (`WaitForConfirm`/`WaitForConfirms` retornam `False`). O reenvio na reconexão é
+  **opt-in** (`RepublishUnconfirmedOnReconnect`, at-least-once); sem ele, reenvie
+  na sua camada se precisar de garantia ponta a ponta.
+- **Recuperação de topologia com filas de nome gerado pelo servidor** — ver a
+  seção dedicada abaixo.
+- TLS é **só Windows** (SChannel). O adapter liga TLS por convenção de porta
+  (`5671`); ainda **não** implementados: mTLS/client-cert, escolha manual de
+  versão/cipher suite, e campos de TLS na config agnóstica do infra (para
+  `verify-off`/dev e `server-name` custom via adapter).
+
+### Recuperação de filas com nome gerado pelo servidor
+
+Ao declarar `QueueName = ''`, o servidor **gera** o nome (`amq.gen-XXXX`). A
+recuperação de topologia na reconexão **assume filas nomeadas**: ela guarda os
+payloads de `declare`/`bind`/`consume` já serializados e os re-executa. Como o
+redeclare com nome vazio gera um nome **novo** e os `bind`/`consume` gravados
+carregam o nome **antigo**, o replay quebra (`basic.consume` na fila inexistente
+→ `404` → o servidor fecha o canal).
+
+**Workaround (recomendado):** se você precisa de fila temporária **e** de
+reconexão, **gere o nome no cliente** em vez de usar `''`:
+
+```pascal
+LDecl.QueueName := 'reply-' + TGUID.NewGuid.ToString;
+LDecl.Exclusive := True;   // some quando a conexão fecha
+LDecl.AutoDelete := True;
+```
+
+Assim a fila é temporária com nome **estável e conhecido**, e a recuperação
+funciona como a de qualquer fila nomeada. Para RPC request/reply, prefira o
+**Direct Reply-to** (`amq.rabbitmq.reply-to`) — um nome-mágico fixo, sem declarar
+fila por requisição, que também não sofre desse problema.
+
+**Caminho das pedras (para quem for forkar e precisar de server-named real):**
+
+1. **Rastrear os nomes gerados** — em `TAMQPChannel.DeclareQueue`, quando o nome
+   informado é `''`, guardar o nome devolvido pelo `Declare-Ok` num conjunto do
+   canal (ex.: `FServerNamedQueues`). Sem isso o canal não sabe que
+   `amq.gen-ABC` é "gerado".
+2. **Recovery estruturado** — hoje `TAMQPRecoveryAction` só guarda
+   `Payload: TBytes` (opaco). Para as ações que referenciam uma fila gerada,
+   guardar também **qual fila** cada `bind`/`consume` referencia (nome-alvo), de
+   modo a poder reconstruir o payload depois.
+3. **Reescrever no replay** — em `TAMQPChannel.Recover`: ao redeclarar com `''`,
+   **capturar o novo nome** do `Declare-Ok` (hoje é descartado), montar um mapa
+   `antigo → novo` e **reconstruir** os payloads de `bind`/`consume` com o nome
+   novo antes de enviá-los.
+4. **Expor o novo nome ao app** — mesmo com o passo 3, o código do usuário ainda
+   segura o nome antigo. Para transparência total, adicionar um callback
+   (ex.: `OnQueueRenamed(old, new)`) para o app atualizar suas referências.
+
+Tudo isso deve ser **gated** por "há fila server-named neste canal?", para o
+caminho de filas nomeadas (já testado) permanecer intacto. Consumer-tags **não**
+são afetados — são gerados no cliente (`ctag-<canal>-<n>`), estáveis na reconexão.
 
 ## Integração com delphi-api-infra-faa
 
