@@ -4,8 +4,8 @@ Cliente **AMQP 0-9-1** para Delphi, escrito do zero a partir da especificação
 pública do protocolo — sem dependências externas (usa só a RTL) e com licença
 **MIT** desde o primeiro commit.
 
-Testado ponta a ponta contra um **RabbitMQ** real: **75 testes unitários** (sem
-broker) + **18 de integração**.
+Testado ponta a ponta contra um **RabbitMQ** real: **80 testes unitários** (sem
+broker) + **24 de integração**.
 
 ## Recursos
 
