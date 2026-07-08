@@ -55,7 +55,7 @@ type
     FItems: TDictionary<string, TListItem>;
     FRecebidas: Integer;
     FProntas: Integer;
-    function MemoAtBottom(AMemo: TMemo): Boolean;
+    function ScrollAtBottom(AHandle: HWND): Boolean;
     procedure Log(const AMsg: string);
     procedure SetConectado(AConectado: Boolean);
     function BuildParams: TAMQPConnectionParams;
@@ -94,14 +94,14 @@ begin
   FreeAndNil(FConn);
 end;
 
-function TfrmRetaguarda.MemoAtBottom(AMemo: TMemo): Boolean;
+function TfrmRetaguarda.ScrollAtBottom(AHandle: HWND): Boolean;
 var
   LInfo: TScrollInfo;
 begin
   FillChar(LInfo, SizeOf(LInfo), 0);
   LInfo.cbSize := SizeOf(LInfo);
   LInfo.fMask := SIF_ALL;
-  if not GetScrollInfo(AMemo.Handle, SB_VERT, LInfo) then
+  if not GetScrollInfo(AHandle, SB_VERT, LInfo) then
     Exit(True); // sem scrollbar ainda (conteúdo cabe todo) = considera "no fim"
   Result := (LInfo.nPos + Integer(LInfo.nPage)) >= LInfo.nMax;
 end;
@@ -110,7 +110,7 @@ procedure TfrmRetaguarda.Log(const AMsg: string);
 var
   LAtBottom: Boolean;
 begin
-  LAtBottom := MemoAtBottom(mmoLog);
+  LAtBottom := ScrollAtBottom(mmoLog.Handle);
   mmoLog.Lines.Add(FormatDateTime('hh:nn:ss', Now) + '  ' + AMsg);
   if LAtBottom then
     SendMessage(mmoLog.Handle, WM_VSCROLL, SB_BOTTOM, 0);
@@ -178,7 +178,9 @@ end;
 procedure TfrmRetaguarda.NotaRecebida(const AChave, AWorker: string);
 var
   LItem: TListItem;
+  LAtBottom: Boolean;
 begin
+  LAtBottom := ScrollAtBottom(lvNotas.Handle);
   LItem := lvNotas.Items.Add;
   LItem.Caption := AChave;
   LItem.SubItems.Add('Recebida');
@@ -188,6 +190,8 @@ begin
   FItems.AddOrSetValue(AChave, LItem);
   Inc(FRecebidas);
   AtualizarContagem;
+  if LAtBottom then
+    LItem.MakeVisible(False);
 end;
 
 procedure TfrmRetaguarda.NotaStatus(const AChave, AStatus: string);

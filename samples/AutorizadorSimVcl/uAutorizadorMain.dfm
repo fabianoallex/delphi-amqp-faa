@@ -1,4 +1,4 @@
-﻿object frmAutorizador: TfrmAutorizador
+object frmAutorizador: TfrmAutorizador
   Left = 0
   Top = 0
   Caption = 'AutorizadorSim (VCL)'
@@ -10,56 +10,59 @@
   Font.Height = -12
   Font.Name = 'Segoe UI'
   Font.Style = []
-  OnCreate = FormCreate
-  OnClose = FormClose
   Position = poScreenCenter
+  OnClose = FormClose
+  OnCreate = FormCreate
+  DesignSize = (
+    500
+    450)
   TextHeight = 15
   object gbConexao: TGroupBox
     Left = 8
     Top = 8
     Width = 484
     Height = 170
-    Caption = ' Conexão '
+    Caption = ' Conex'#227'o '
     TabOrder = 0
     object lblHost: TLabel
       Left = 16
       Top = 28
-      Width = 29
+      Width = 28
       Height = 15
       Caption = 'Host:'
     end
     object lblPort: TLabel
       Left = 270
       Top = 28
-      Width = 33
+      Width = 31
       Height = 15
       Caption = 'Porta:'
     end
     object lblVHost: TLabel
       Left = 16
       Top = 57
-      Width = 39
+      Width = 35
       Height = 15
       Caption = 'VHost:'
     end
     object lblUser: TLabel
       Left = 270
       Top = 57
-      Width = 45
+      Width = 43
       Height = 15
-      Caption = 'Usuário:'
+      Caption = 'Usu'#225'rio:'
     end
     object lblPassword: TLabel
       Left = 16
       Top = 86
-      Width = 34
+      Width = 35
       Height = 15
       Caption = 'Senha:'
     end
     object lblStatus: TLabel
       Left = 140
       Top = 145
-      Width = 84
+      Width = 79
       Height = 15
       Caption = 'Desconectado'
       Font.Charset = DEFAULT_CHARSET
@@ -144,19 +147,19 @@
     Top = 186
     Width = 484
     Height = 90
-    Caption = ' Publicação '
+    Caption = ' Publica'#231#227'o '
     TabOrder = 1
     object lblQueue: TLabel
       Left = 16
       Top = 28
-      Width = 24
+      Width = 21
       Height = 15
       Caption = 'Fila:'
     end
     object lblQtd: TLabel
       Left = 310
       Top = 28
-      Width = 66
+      Width = 65
       Height = 15
       Caption = 'Quantidade:'
     end
