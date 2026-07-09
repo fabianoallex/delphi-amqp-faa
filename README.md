@@ -233,6 +233,21 @@ LChannel.Consume('nfe.respostas',
 `Consume` devolve o *consumer-tag* (use em `Cancel`). Com `ANoAck=False`
 (padrão), confirme cada mensagem com `Ack` (ou `Nack`).
 
+> **O callback precisa sempre terminar sozinho.** `Close`/`Destroy` do canal
+> esperam (sem timeout, de propósito) os callbacks em voo terminarem antes de
+> liberar o objeto — IO demorado é ok, mas um callback que bloqueia
+> indefinidamente esperando interação do usuário ou um evento que só outra
+> thread da aplicação sinaliza trava esse fechamento; se o `Free` roda na
+> thread principal de uma app VCL, a UI congela junto (deadlock). Se o fluxo
+> depende de aprovação humana, prefira **não bloquear**: guarde o
+> *delivery-tag* e o conteúdo numa estrutura própria, retorne, e confirme
+> depois (`Ack`/`Nack` podem ser chamados de qualquer thread). Se optar por
+> bloquear num `TEvent`, o encerramento precisa acordar **todas** as esperas e
+> também cobrir entregas que cheguem *durante* a desconexão — um nack+requeue
+> pode ser reentregue imediatamente ao mesmo consumer até o `Cancel`
+> completar (`samples/RetaguardaVcl` mostra o padrão com flag de
+> encerramento).
+
 ### Reconexão automática
 
 ```pascal

@@ -13,7 +13,16 @@
   FPendingLock) até o usuário clicar Aceitar/Rejeitar na tela para a nota
   selecionada na ListView. Ao desconectar/fechar, CancelarPendencias libera
   qualquer thread ainda bloqueada (como nack+requeue) antes de cancelar o
-  consumer e fechar o canal. }
+  consumer e fechar o canal.
+
+  FEncerrando fecha uma corrida do encerramento: o nack+requeue disparado por
+  CancelarPendencias pode fazer o broker reentregar a mensagem ao consumer
+  (ainda ativo até o Cancel-Ok), e esse callback novo estacionaria num TEvent
+  que ninguém mais vai sinalizar — enquanto o Destroy do canal espera, na
+  thread principal, todos os callbacks terminarem (deadlock: UI congelada).
+  Com o flag (setado sob FPendingLock antes de acordar os eventos), qualquer
+  entrega que chegue depois do início do encerramento sai sem ack/nack — o
+  fechamento do canal devolve a mensagem à fila. }
 
 interface
 
@@ -81,6 +90,7 @@ type
     FManualMode: Boolean;
     FPending: TDictionary<string, TPendingApproval>;
     FPendingLock: TObject;
+    FEncerrando: Boolean; // protegido por FPendingLock
     function ScrollAtBottom(AHandle: HWND): Boolean;
     procedure Log(const AMsg: string);
     procedure SetConectado(AConectado: Boolean);
@@ -225,6 +235,7 @@ var
 begin
   System.TMonitor.Enter(FPendingLock);
   try
+    FEncerrando := True; // entregas daqui em diante não estacionam no TEvent
     for LApproval in FPending.Values do
     begin
       LApproval.Aceitar := False;
@@ -346,6 +357,8 @@ begin
     FChannel.DeclareQueue(TAMQPQueueDeclare.Create(LQueue, True));
     FChannel.Qos(LPrefetch);
     FManualMode := chkManual.Checked;
+    // Sem lock: nenhum callback vivo aqui (o canal anterior foi drenado no Free).
+    FEncerrando := False;
 
     FConsumerTag := FChannel.Consume(
       LQueue,
@@ -368,13 +381,26 @@ begin
 
         if FManualMode then
         begin
-          LApproval := TPendingApproval.Create;
-          LApproval.Event := TEvent.Create(nil, True, False, '');
           System.TMonitor.Enter(FPendingLock);
           try
-            FPending.Add(LChave, LApproval);
+            if FEncerrando then
+              LApproval := nil // CancelarPendencias já passou; ninguém acordaria o TEvent
+            else
+            begin
+              LApproval := TPendingApproval.Create;
+              LApproval.Event := TEvent.Create(nil, True, False, '');
+              FPending.Add(LChave, LApproval);
+            end;
           finally
             System.TMonitor.Exit(FPendingLock);
+          end;
+
+          if LApproval = nil then
+          begin
+            // Sai sem ack/nack: o fechamento do canal devolve a mensagem à
+            // fila. Nack aqui reiniciaria o ciclo de redelivery imediato.
+            TThread.Queue(nil, procedure begin NotaStatus(LChave, 'Devolvida (desconexão)'); end);
+            Exit;
           end;
 
           TThread.Queue(
