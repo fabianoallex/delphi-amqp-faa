@@ -1,8 +1,8 @@
-﻿object frmRetaguarda: TfrmRetaguarda
+object frmRetaguarda: TfrmRetaguarda
   Left = 0
   Top = 0
   Caption = 'Retaguarda (VCL)'
-  ClientHeight = 640
+  ClientHeight = 740
   ClientWidth = 560
   Color = clBtnFace
   Font.Charset = DEFAULT_CHARSET
@@ -10,57 +10,68 @@
   Font.Height = -12
   Font.Name = 'Segoe UI'
   Font.Style = []
-  OnCreate = FormCreate
-  OnClose = FormClose
-  OnDestroy = FormDestroy
   Position = poScreenCenter
+  OnClose = FormClose
+  OnCreate = FormCreate
+  OnDestroy = FormDestroy
+  DesignSize = (
+    560
+    740)
   TextHeight = 15
+  object lblContagem: TLabel
+    Left = 8
+    Top = 641
+    Width = 138
+    Height = 15
+    Anchors = [akLeft, akBottom]
+    Caption = 'Recebidas: 0   |   Prontas: 0'
+  end
   object gbConexao: TGroupBox
     Left = 8
     Top = 8
     Width = 540
     Height = 170
-    Caption = ' Conexão '
+    Caption = ' Conex'#227'o '
     TabOrder = 0
     object lblHost: TLabel
       Left = 16
       Top = 28
-      Width = 29
+      Width = 28
       Height = 15
       Caption = 'Host:'
     end
     object lblPort: TLabel
       Left = 270
       Top = 28
-      Width = 33
+      Width = 31
       Height = 15
       Caption = 'Porta:'
     end
     object lblVHost: TLabel
       Left = 16
       Top = 57
-      Width = 39
+      Width = 35
       Height = 15
       Caption = 'VHost:'
     end
     object lblUser: TLabel
       Left = 270
       Top = 57
-      Width = 45
+      Width = 43
       Height = 15
-      Caption = 'Usuário:'
+      Caption = 'Usu'#225'rio:'
     end
     object lblPassword: TLabel
       Left = 16
       Top = 86
-      Width = 34
+      Width = 35
       Height = 15
       Caption = 'Senha:'
     end
     object lblStatus: TLabel
       Left = 140
       Top = 145
-      Width = 84
+      Width = 79
       Height = 15
       Caption = 'Desconectado'
       Font.Charset = DEFAULT_CHARSET
@@ -144,20 +155,20 @@
     Left = 8
     Top = 186
     Width = 540
-    Height = 60
+    Height = 90
     Caption = ' Consumo '
     TabOrder = 1
     object lblQueue: TLabel
       Left = 16
       Top = 26
-      Width = 24
+      Width = 21
       Height = 15
       Caption = 'Fila:'
     end
     object lblPrefetch: TLabel
       Left = 310
       Top = 26
-      Width = 53
+      Width = 47
       Height = 15
       Caption = 'Prefetch:'
     end
@@ -177,11 +188,55 @@
       TabOrder = 1
       Text = '10'
     end
+    object chkManual: TCheckBox
+      Left = 16
+      Top = 56
+      Width = 300
+      Height = 17
+      Caption = 'Confirma'#231#227'o manual (aceitar/rejeitar cada nota)'
+      TabOrder = 2
+    end
+  end
+  object gbAprovacao: TGroupBox
+    Left = 8
+    Top = 284
+    Width = 540
+    Height = 60
+    Caption = ' Aprova'#231#227'o manual '
+    TabOrder = 2
+    object btnAceitar: TButton
+      Left = 16
+      Top = 22
+      Width = 110
+      Height = 25
+      Caption = 'Aceitar (ACK)'
+      Enabled = False
+      TabOrder = 0
+      OnClick = btnAceitarClick
+    end
+    object btnRejeitar: TButton
+      Left = 134
+      Top = 22
+      Width = 110
+      Height = 25
+      Caption = 'Rejeitar (NACK)'
+      Enabled = False
+      TabOrder = 1
+      OnClick = btnRejeitarClick
+    end
+    object chkRequeue: TCheckBox
+      Left = 254
+      Top = 27
+      Width = 200
+      Height = 17
+      Caption = 'Reencaminhar (requeue)'
+      TabOrder = 2
+    end
   end
   object lvNotas: TListView
     Left = 8
-    Top = 254
-    Width = 540
+    Top = 352
+    Width = 538
     Height = 280
     Anchors = [akLeft, akTop, akRight, akBottom]
     Columns = <
@@ -208,35 +263,37 @@
     GridLines = True
     ReadOnly = True
     RowSelect = True
-    TabOrder = 2
+    TabOrder = 3
     ViewStyle = vsReport
   end
-  object lblContagem: TLabel
-    Left = 8
-    Top = 541
-    Width = 149
-    Height = 15
-    Anchors = [akLeft, akBottom]
-    Caption = 'Recebidas: 0   |   Prontas: 0'
-  end
   object btnLimparLog: TButton
-    Left = 452
-    Top = 537
+    Left = 450
+    Top = 636
     Width = 96
     Height = 23
     Anchors = [akRight, akBottom]
     Caption = 'Limpar log'
-    TabOrder = 3
+    TabOrder = 4
     OnClick = btnLimparLogClick
   end
   object mmoLog: TMemo
     Left = 8
-    Top = 565
-    Width = 540
+    Top = 665
+    Width = 538
     Height = 67
     Anchors = [akLeft, akRight, akBottom]
     ReadOnly = True
     ScrollBars = ssVertical
-    TabOrder = 4
+    TabOrder = 5
+  end
+  object Button1: TButton
+    Left = 348
+    Top = 636
+    Width = 96
+    Height = 23
+    Anchors = [akRight, akBottom]
+    Caption = 'Limpar Lista'
+    TabOrder = 6
+    OnClick = Button1Click
   end
 end

@@ -6,17 +6,30 @@
   toca a ListView/label via TThread.Queue — o dicionário FItems só é acessado
   a partir do procedimento marshalled na thread principal, então não precisa
   de lock próprio. Mesmo "processamento" simulado do sample console (Sleep
-  aleatório fazendo o papel de busca do XML). }
+  aleatório fazendo o papel de busca do XML).
+
+  Modo "Confirmação manual": em vez do Sleep+ack automático, a thread do
+  consumer fica bloqueada num TEvent por mensagem (FPending, protegido por
+  FPendingLock) até o usuário clicar Aceitar/Rejeitar na tela para a nota
+  selecionada na ListView. Ao desconectar/fechar, CancelarPendencias libera
+  qualquer thread ainda bloqueada (como nack+requeue) antes de cancelar o
+  consumer e fechar o canal. }
 
 interface
 
 uses
   Winapi.Windows, Winapi.Messages, System.SysUtils, System.Classes,
-  System.Generics.Collections, Vcl.Graphics, Vcl.Controls, Vcl.Forms,
-  Vcl.Dialogs, Vcl.StdCtrls, Vcl.ComCtrls,
+  System.SyncObjs, System.Generics.Collections, Vcl.Graphics, Vcl.Controls,
+  Vcl.Forms, Vcl.Dialogs, Vcl.StdCtrls, Vcl.ComCtrls,
   AMQP.Connection, AMQP.Queue.Methods;
 
 type
+  TPendingApproval = class
+    Event: TEvent;
+    Aceitar: Boolean;
+    Requeue: Boolean;
+  end;
+
   TfrmRetaguarda = class(TForm)
     gbConexao: TGroupBox;
     lblHost: TLabel;
@@ -38,16 +51,25 @@ type
     edtQueue: TEdit;
     lblPrefetch: TLabel;
     edtPrefetch: TEdit;
+    chkManual: TCheckBox;
+    gbAprovacao: TGroupBox;
+    btnAceitar: TButton;
+    btnRejeitar: TButton;
+    chkRequeue: TCheckBox;
     lvNotas: TListView;
     lblContagem: TLabel;
     btnLimparLog: TButton;
     mmoLog: TMemo;
+    Button1: TButton;
     procedure FormCreate(Sender: TObject);
     procedure FormClose(Sender: TObject; var Action: TCloseAction);
     procedure FormDestroy(Sender: TObject);
     procedure btnConectarClick(Sender: TObject);
     procedure btnLimparLogClick(Sender: TObject);
     procedure chkUseTlsClick(Sender: TObject);
+    procedure Button1Click(Sender: TObject);
+    procedure btnAceitarClick(Sender: TObject);
+    procedure btnRejeitarClick(Sender: TObject);
   private
     FConn: TAMQPConnection;
     FChannel: TAMQPChannel;
@@ -55,6 +77,10 @@ type
     FItems: TDictionary<string, TListItem>;
     FRecebidas: Integer;
     FProntas: Integer;
+    FRejeitadas: Integer;
+    FManualMode: Boolean;
+    FPending: TDictionary<string, TPendingApproval>;
+    FPendingLock: TObject;
     function ScrollAtBottom(AHandle: HWND): Boolean;
     procedure Log(const AMsg: string);
     procedure SetConectado(AConectado: Boolean);
@@ -62,6 +88,8 @@ type
     procedure AtualizarContagem;
     procedure NotaRecebida(const AChave, AWorker: string);
     procedure NotaStatus(const AChave, AStatus: string);
+    procedure ResolverSelecionada(AAceitar, ARequeue: Boolean);
+    procedure CancelarPendencias;
   end;
 
 var
@@ -75,16 +103,21 @@ procedure TfrmRetaguarda.FormCreate(Sender: TObject);
 begin
   Randomize;
   FItems := TDictionary<string, TListItem>.Create;
+  FPending := TDictionary<string, TPendingApproval>.Create;
+  FPendingLock := TObject.Create;
   SetConectado(False);
 end;
 
 procedure TfrmRetaguarda.FormDestroy(Sender: TObject);
 begin
+  FPendingLock.Free;
+  FPending.Free;
   FItems.Free;
 end;
 
 procedure TfrmRetaguarda.FormClose(Sender: TObject; var Action: TCloseAction);
 begin
+  CancelarPendencias;
   if Assigned(FChannel) and (FConsumerTag <> '') then
     try
       FChannel.Cancel(FConsumerTag);
@@ -145,6 +178,64 @@ begin
   Result.TlsVerifyPeer := chkTlsVerifyPeer.Checked;
 end;
 
+procedure TfrmRetaguarda.Button1Click(Sender: TObject);
+begin
+  lvNotas.Items.Clear;
+end;
+
+procedure TfrmRetaguarda.ResolverSelecionada(AAceitar, ARequeue: Boolean);
+var
+  LChave: string;
+  LApproval: TPendingApproval;
+begin
+  if lvNotas.Selected = nil then
+  begin
+    Log('Selecione uma nota na lista antes de aceitar/rejeitar.');
+    Exit;
+  end;
+  LChave := lvNotas.Selected.Caption;
+  System.TMonitor.Enter(FPendingLock);
+  try
+    if not FPending.TryGetValue(LChave, LApproval) then
+    begin
+      Log('Nota "' + LChave + '" não está aguardando aprovação.');
+      Exit;
+    end;
+    LApproval.Aceitar := AAceitar;
+    LApproval.Requeue := ARequeue;
+  finally
+    System.TMonitor.Exit(FPendingLock);
+  end;
+  LApproval.Event.SetEvent;
+end;
+
+procedure TfrmRetaguarda.btnAceitarClick(Sender: TObject);
+begin
+  ResolverSelecionada(True, False);
+end;
+
+procedure TfrmRetaguarda.btnRejeitarClick(Sender: TObject);
+begin
+  ResolverSelecionada(False, chkRequeue.Checked);
+end;
+
+procedure TfrmRetaguarda.CancelarPendencias;
+var
+  LApproval: TPendingApproval;
+begin
+  System.TMonitor.Enter(FPendingLock);
+  try
+    for LApproval in FPending.Values do
+    begin
+      LApproval.Aceitar := False;
+      LApproval.Requeue := True;
+      LApproval.Event.SetEvent;
+    end;
+  finally
+    System.TMonitor.Exit(FPendingLock);
+  end;
+end;
+
 procedure TfrmRetaguarda.SetConectado(AConectado: Boolean);
 begin
   if AConectado then
@@ -168,11 +259,15 @@ begin
   chkTlsVerifyPeer.Enabled := (not AConectado) and chkUseTls.Checked;
   edtQueue.Enabled := not AConectado;
   edtPrefetch.Enabled := not AConectado;
+  chkManual.Enabled := not AConectado;
+  btnAceitar.Enabled := AConectado;
+  btnRejeitar.Enabled := AConectado;
 end;
 
 procedure TfrmRetaguarda.AtualizarContagem;
 begin
-  lblContagem.Caption := Format('Recebidas: %d   |   Prontas: %d', [FRecebidas, FProntas]);
+  lblContagem.Caption := Format('Recebidas: %d   |   Prontas: %d   |   Rejeitadas: %d',
+    [FRecebidas, FProntas, FRejeitadas]);
 end;
 
 procedure TfrmRetaguarda.NotaRecebida(const AChave, AWorker: string);
@@ -206,6 +301,12 @@ begin
     LItem.SubItems[3] := FormatDateTime('hh:nn:ss', Now);
     Inc(FProntas);
     AtualizarContagem;
+  end
+  else if (AStatus = 'Rejeitada') or (AStatus = 'Rejeitada (requeue)') then
+  begin
+    LItem.SubItems[3] := FormatDateTime('hh:nn:ss', Now);
+    Inc(FRejeitadas);
+    AtualizarContagem;
   end;
 end;
 
@@ -214,10 +315,12 @@ var
   LParams: TAMQPConnectionParams;
   LPrefetch: Integer;
   LQueue: string;
+  LMsg: string;
 begin
   if Assigned(FConn) then
   begin
     try
+      CancelarPendencias;
       if (FChannel <> nil) and (FConsumerTag <> '') then
         FChannel.Cancel(FConsumerTag);
       FConsumerTag := '';
@@ -238,49 +341,120 @@ begin
   try
     FConn := TAMQPConnection.Create(LParams);
     FConn.Open;
+
     FChannel := FConn.CreateChannel;
     FChannel.DeclareQueue(TAMQPQueueDeclare.Create(LQueue, True));
     FChannel.Qos(LPrefetch);
-    FConsumerTag := FChannel.Consume(LQueue,
+    FManualMode := chkManual.Checked;
+
+    FConsumerTag := FChannel.Consume(
+      LQueue,
       procedure(AChannel: TAMQPChannel; const ADelivery: TAMQPDelivery)
       var
         LChave, LWorker: string;
         LDelay: Integer;
+        LApproval: TPendingApproval;
       begin
         LChave := ADelivery.BodyAsText;
         LWorker := Format('%d', [TThread.CurrentThread.ThreadID]);
-        TThread.Queue(nil,
+
+        TThread.Queue(
+          nil,
           procedure
           begin
             NotaRecebida(LChave, LWorker);
-          end);
+          end
+        );
 
-        LDelay := 300 + Random(1200);
-        TThread.Queue(nil,
+        if FManualMode then
+        begin
+          LApproval := TPendingApproval.Create;
+          LApproval.Event := TEvent.Create(nil, True, False, '');
+          System.TMonitor.Enter(FPendingLock);
+          try
+            FPending.Add(LChave, LApproval);
+          finally
+            System.TMonitor.Exit(FPendingLock);
+          end;
+
+          TThread.Queue(
+            nil,
+            procedure
+            begin
+              NotaStatus(LChave, 'Aguardando aprovação');
+            end
+          );
+
+          LApproval.Event.WaitFor(INFINITE);
+
+          System.TMonitor.Enter(FPendingLock);
+          try
+            FPending.Remove(LChave);
+          finally
+            System.TMonitor.Exit(FPendingLock);
+          end;
+
+          try
+            if LApproval.Aceitar then
+            begin
+              AChannel.Ack(ADelivery.DeliveryTag);
+              TThread.Queue(nil, procedure begin NotaStatus(LChave, 'Pronta'); end);
+            end
+            else
+            begin
+              AChannel.Nack(ADelivery.DeliveryTag, LApproval.Requeue);
+              if LApproval.Requeue then
+                TThread.Queue(nil, procedure begin NotaStatus(LChave, 'Rejeitada (requeue)'); end)
+              else
+                TThread.Queue(nil, procedure begin NotaStatus(LChave, 'Rejeitada'); end);
+            end;
+          finally
+            LApproval.Event.Free;
+            LApproval.Free;
+          end;
+          Exit;
+        end;
+
+        LDelay := 300 + Random(2200);
+        TThread.Queue(
+          nil,
           procedure
           begin
             NotaStatus(LChave, 'Processando');
-          end);
+          end
+        );
+
         Sleep(LDelay);
 
         try
-          TThread.Queue(nil,
+          TThread.Queue(
+            nil,
             procedure
             begin
               NotaStatus(LChave, 'Pronta');
-            end);
+            end
+          );
+
           AChannel.Ack(ADelivery.DeliveryTag);
         except
           AChannel.Nack(ADelivery.DeliveryTag, True);
-          TThread.Queue(nil,
+          TThread.Queue(
+            nil,
             procedure
             begin
               NotaStatus(LChave, 'Erro');
-            end);
+            end
+          );
         end;
-      end);
-    Log(Format('Conectado a %s:%d%s. Consumindo "%s" (prefetch %d).',
-      [LParams.Host, LParams.Port, LParams.VirtualHost, LQueue, LPrefetch]));
+      end
+    );
+
+    LMsg := Format('Conectado a %s:%d%s. Consumindo "%s" (prefetch %d).',
+      [LParams.Host, LParams.Port, LParams.VirtualHost, LQueue, LPrefetch]);
+    if FManualMode then
+      LMsg := LMsg + ' Confirmação manual ativada.';
+    Log(LMsg);
+
     SetConectado(True);
   except
     on E: Exception do
