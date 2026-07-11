@@ -134,6 +134,13 @@ begin
     except
     end;
   FreeAndNil(FChannel);
+  // DrainInFlight (dentro do Free acima) bloqueia esta thread num Sleep até o
+  // callback em andamento terminar — o loop de mensagens fica parado nesse
+  // meio-tempo, então qualquer TThread.Queue postado pelo callback (closure
+  // de NotaStatus/NotaRecebida) fica preso na fila e vazaria se a aplicação
+  // fechasse sem nunca voltar ao loop de mensagens. Bombear aqui drena esse
+  // pendente com segurança, pois a form e seus controles ainda estão vivos.
+  Application.ProcessMessages;
   FreeAndNil(FConn);
 end;
 
