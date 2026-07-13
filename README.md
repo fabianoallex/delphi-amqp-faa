@@ -286,7 +286,10 @@ de status no console). Suba o broker (`docker compose -f
 docker/docker-compose.yml up -d`), rode o `Retaguarda` e, em seguida, o
 `AutorizadorSim` — as linhas `[worker N] iniciando...` de notas diferentes
 aparecem intercaladas no console do `Retaguarda`, confirmando o processamento
-em paralelo.
+em paralelo. Com `Retaguarda --dedicado`, o canal usa worker próprio (ver
+[opção 2](#como-obter-ordem-quando-ela-importa)) — as mesmas linhas aparecem
+em ordem, uma nota de cada vez. `samples/RetaguardaVcl` tem o mesmo modo via
+checkbox "Thread dedicada".
 
 ## Arquitetura (resumo)
 
@@ -326,11 +329,13 @@ LChannel.Consume('nfe.respostas',
 
 Serializa **tudo** daquele consumer — sem paralelismo algum. Boa escolha quando ordem estrita é obrigatória e o volume não é o gargalo.
 
-**2. Fila própria da aplicação + uma thread dedicada** — o callback só empilha a entrega numa fila thread-safe (ex. `TCriticalSection` + `TQueue`); uma única thread dedicada drena e processa em ordem de chegada, chamando `Ack` no fim de cada item. Preserva ordem real de chegada e deixa o `Qos`/prefetch livre pra continuar recebendo em paralelo do broker enquanto sua fila processa. É a mesma ideia do padrão "capture o delivery-tag e confirme depois" já descrito acima para fluxos de aprovação humana — aqui a diferença é que quem drena é uma única thread, não N.
+**2. Canal com worker dedicado (`CreateChannel(True)`)** — opção nativa da lib: em vez do pool nativo (`TTask`), o canal ganha uma thread própria que processa deliveries/returns/confirms um de cada vez, na ordem de chegada. Diferente do `Qos(1)`, o broker continua entregando até o prefetch configurado — só o processamento no cliente é serializado, não o fluxo de rede. Zero código de aplicação; outros canais da mesma conexão continuam concorrentes normalmente. Ver `samples/Retaguarda` (flag `--dedicado`) e `samples/RetaguardaVcl` (checkbox "Thread dedicada").
 
-**3. Sharding por chave** — variação da opção 2 com N filas de uma thread cada, escolhida por hash de alguma chave de domínio (ex. `CorrelationId`, id do PDV). Ordem garantida *por chave*, paralelismo entre chaves diferentes — bom meio-termo quando só importa "ordem por entidade", não ordem global.
+**3. Fila própria da aplicação + uma thread dedicada** — o callback só empilha a entrega numa fila thread-safe (ex. `TCriticalSection` + `TQueue`); uma única thread dedicada drena e processa em ordem de chegada, chamando `Ack` no fim de cada item. É a mesma ideia do padrão "capture o delivery-tag e confirme depois" já descrito acima para fluxos de aprovação humana. Só vale a pena sobre a opção 2 quando você precisa de algo que o worker dedicado da lib não oferece — por exemplo, backpressure própria (limitar o tamanho da fila) ou compartilhar uma única fila de processamento entre mais de um canal/consumer.
 
-As opções 2 e 3 são implementadas inteiramente na aplicação, com a API pública já existente (`Consume`/`Ack`/`Nack`/`Qos`/`TAMQPDelivery`) — não exigem nenhuma mudança na lib. Duas pegadinhas a observar:
+**4. Sharding por chave** — variação da opção 3 com N filas de uma thread cada, escolhida por hash de alguma chave de domínio (ex. `CorrelationId`, id do PDV). Ordem garantida *por chave*, paralelismo entre chaves diferentes — bom meio-termo quando só importa "ordem por entidade", não ordem global.
+
+A opção 2 é built-in (`CreateChannel(ADedicatedConsumerThread: Boolean)`); as opções 3 e 4 são implementadas inteiramente na aplicação, com a API pública já existente (`Consume`/`Ack`/`Nack`/`Qos`/`TAMQPDelivery`) — não exigem nenhuma mudança na lib. Duas pegadinhas a observar nas opções 3 e 4:
 
 - **`ADelivery.Properties.Headers` é liberado pela lib assim que a callback retorna** (o dono é o chamador, mas o pool libera automaticamente depois que o callback volta). Se o callback só empilha a entrega e retorna na hora, `Headers` já estará inválido quando a thread dedicada for processar depois — extraia o que precisar dos headers **antes** de retornar do callback; não guarde a referência ao `TAMQPFieldTable` pra usar depois.
 - **`Channel.Close`/`Free` não sabe da sua fila própria.** Como o callback retorna assim que empilha, o contador interno de "em voo" da lib já dá aquela mensagem como concluída. Ao fechar a aplicação, é responsabilidade de quem implementou a fila própria esperá-la esvaziar antes de fechar o canal — senão mensagens já retiradas da lib mas ainda não processadas/ackadas podem se perder.

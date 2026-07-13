@@ -10,7 +10,11 @@ program Retaguarda;
   nativo (TTask, dentro de TAMQPChannel.DispatchDelivery) - o callback
   abaixo roda concorrente para mensagens diferentes sem nenhum TTask.Run
   manual, e a thread de leitura nunca fica bloqueada esperando
-  ProcessarChave terminar. }
+  ProcessarChave terminar.
+
+  Argumento opcional --dedicado: usa CreateChannel(True), que troca o pool
+  nativo (TTask, concorrente) por um worker fixo do proprio canal - entregas
+  processadas uma de cada vez, na ordem em que chegaram. }
 
 {$APPTYPE CONSOLE}
 
@@ -75,7 +79,9 @@ var
   LConsumerTag: string;
   Linha: string;
   Par: TPair<string, string>;
+  LDedicado: Boolean;
 begin
+  LDedicado := (ParamCount > 0) and SameText(ParamStr(1), '--dedicado');
   NotasProntas := TDictionary<string, string>.Create;
   Lock := TCriticalSection.Create;
   try
@@ -83,7 +89,7 @@ begin
     LConn := TAMQPConnection.Create(LParams);
     try
       LConn.Open;
-      LChannel := LConn.CreateChannel;
+      LChannel := LConn.CreateChannel(LDedicado);
       try
         LChannel.DeclareQueue(TAMQPQueueDeclare.Create(QUEUE_NAME, True));
         LChannel.Qos(10); // prefetch: limita mensagens nao confirmadas em voo
@@ -106,6 +112,8 @@ begin
           end);
 
         Writeln('[*] Aguardando retornos na fila "', QUEUE_NAME, '".');
+        if LDedicado then
+          Writeln('[*] Thread dedicada ativa: entregas processadas em ordem, sem concorrencia.');
         Writeln('[*] Pressione ENTER a qualquer momento pra ver o status (ou digite "sair" + ENTER pra fechar).');
 
         repeat

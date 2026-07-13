@@ -186,6 +186,35 @@ type
     Body: TBytes;
   end;
 
+  { Item de trabalho enfileirado no worker dedicado: embrulha a closure numa
+    classe porque TQueue<TProc> (TProc = reference to procedure) não compila
+    (E2010 Incompatible types) ao fazer Dequeue direto para uma variável
+    TProc - mesma razão pela qual a porta FPC usa TAMQPWorkItem em vez de
+    guardar "reference to procedure" cru numa fila genérica. }
+  TAMQPDedicatedWorkItem = class
+  public
+    Proc: TProc;
+  end;
+
+  { Worker dedicado (thread única) usado quando um canal opta por
+    processamento sequencial das entregas/returns/confirms, em vez de
+    despachar cada uma pro pool nativo (TTask.Run) - ver
+    TAMQPConnection.CreateChannel(ADedicatedConsumerThread). Drena a fila
+    interna em ordem de chegada, uma closure de cada vez. }
+  TAMQPDedicatedWorker = class
+  private
+    FThread: TThread;
+    FLock: TCriticalSection;
+    FWork: TEvent; // auto-reset: um SetEvent acorda a thread pra checar a fila
+    FQueue: TQueue<TAMQPDedicatedWorkItem>;
+    FShutdown: Boolean;
+    procedure Execute;
+  public
+    constructor Create;
+    destructor Destroy; override;
+    procedure Enqueue(const AProc: TProc);
+  end;
+
   { Canal de dados. Criado via TAMQPConnection.CreateChannel (que já o abre).
     O chamador é dono do canal e deve liberá-lo (Free). }
   TAMQPChannel = class
@@ -216,6 +245,10 @@ type
     FConsumerCounter: Integer;
     FOnBasicReturn: TAMQPBasicReturnCallback;
     FInFlight: Integer; // callbacks em execução no pool (atômico)
+    // Worker privado (1 thread) quando o canal usa thread dedicada; nil =>
+    // despacha pro pool nativo (TTask.Run), comportamento padrão. Ver
+    // CreateChannel.
+    FDispatchPool: TAMQPDedicatedWorker;
     // --- publisher confirms ---
     // FConfirmMon é lock + variável de condição (System.TMonitor) que protege
     // FUnconfirmed/FNacked/FPublishSeqNo/FConfirmBase e acorda WaitForConfirm(s).
@@ -259,6 +292,10 @@ type
     procedure SignalMessage(const AMessage: TAMQPGetResult);
     procedure SignalError(const AMessage: string);
     procedure CompleteContent;
+    /// Enfileira uma closure no worker dedicado do canal (se houver) ou no
+    /// pool nativo (TTask.Run). Não chamar de "Dispatch": colidiria com o
+    /// TObject.Dispatch usado no mecanismo de message dispatch.
+    procedure DispatchToPool(const AProc: TProc);
     /// Despacha uma entrega para o callback do consumer, no thread pool.
     procedure DispatchDelivery(const ADeliver: TAMQPBasicDeliver;
       const AProps: TAMQPBasicProperties; const ABody: TBytes);
@@ -447,7 +484,10 @@ type
     /// Conecta o socket e executa o handshake. Levanta EAMQPConnection em falha.
     procedure Open;
     /// Abre um novo canal (já aberto). O chamador é dono e deve liberá-lo.
-    function CreateChannel: TAMQPChannel;
+    /// ADedicatedConsumerThread: se True, as entregas/returns/confirms deste
+    /// canal são despachados para uma única thread própria do canal (ordem
+    /// garantida, nunca concorrente) em vez do pool nativo (TTask.Run).
+    function CreateChannel(ADedicatedConsumerThread: Boolean = False): TAMQPChannel;
     /// Envia Connection.Close, aguarda Close-Ok e fecha o socket.
     procedure Close(AReplyCode: Word = 200; const AReplyText: string = 'Goodbye');
     /// Fecha o socket abruptamente para simular queda de rede (uso em testes).
@@ -1179,7 +1219,7 @@ begin
   end;
 end;
 
-function TAMQPConnection.CreateChannel: TAMQPChannel;
+function TAMQPConnection.CreateChannel(ADedicatedConsumerThread: Boolean): TAMQPChannel;
 var
   LChan: TAMQPChannel;
 begin
@@ -1197,6 +1237,8 @@ begin
     Inc(FNextChannel);
     LChan := TAMQPChannel.Create(Self, FNextChannel);
     try
+      if ADedicatedConsumerThread then
+        LChan.FDispatchPool := TAMQPDedicatedWorker.Create;
       FChannels.Add(LChan.ChannelId, LChan);
     except
       LChan.Free;
@@ -1246,6 +1288,98 @@ begin
   CloseSocketStream;
 end;
 
+{ TAMQPDedicatedWorker }
+
+constructor TAMQPDedicatedWorker.Create;
+begin
+  inherited Create;
+  FLock := TCriticalSection.Create;
+  FWork := TEvent.Create(nil, False, False, '');
+  FQueue := TQueue<TAMQPDedicatedWorkItem>.Create;
+  FThread := TThread.CreateAnonymousThread(
+    procedure
+    begin
+      Execute;
+    end);
+  FThread.FreeOnTerminate := False;
+  FThread.Start;
+end;
+
+destructor TAMQPDedicatedWorker.Destroy;
+begin
+  FLock.Enter;
+  try
+    FShutdown := True;
+  finally
+    FLock.Leave;
+  end;
+  FWork.SetEvent;
+  FThread.WaitFor;
+  FThread.Free;
+  while FQueue.Count > 0 do
+    FQueue.Dequeue.Free;
+  FQueue.Free;
+  FWork.Free;
+  FLock.Free;
+  inherited;
+end;
+
+procedure TAMQPDedicatedWorker.Enqueue(const AProc: TProc);
+var
+  LItem: TAMQPDedicatedWorkItem;
+begin
+  LItem := TAMQPDedicatedWorkItem.Create;
+  LItem.Proc := AProc;
+  FLock.Enter;
+  try
+    if FShutdown then
+    begin
+      LItem.Free; // não deveria acontecer: DrainInFlight garante fila vazia antes do Free
+      Exit;
+    end;
+    FQueue.Enqueue(LItem);
+  finally
+    FLock.Leave;
+  end;
+  FWork.SetEvent;
+end;
+
+procedure TAMQPDedicatedWorker.Execute;
+var
+  LItem: TAMQPDedicatedWorkItem;
+  LHasWork: Boolean;
+begin
+  while True do
+  begin
+    FWork.WaitFor(INFINITE);
+    repeat
+      LItem := nil;
+      LHasWork := False;
+      FLock.Enter;
+      try
+        if FQueue.Count > 0 then
+        begin
+          LItem := FQueue.Dequeue;
+          LHasWork := True;
+        end
+        else if FShutdown then
+          Exit;
+      finally
+        FLock.Leave;
+      end;
+      if LHasWork then
+      begin
+        try
+          LItem.Proc();
+        except
+          // exceção no callback do usuário não pode derrubar o worker
+        end;
+        LItem.Free;
+      end;
+    until not LHasWork;
+  end;
+end;
+
 { TAMQPChannel }
 
 constructor TAMQPChannel.Create(AConnection: TAMQPConnection; AChannelId: Word);
@@ -1275,6 +1409,7 @@ begin
     except
     end;
   DrainInFlight; // garante que nenhum callback ainda usa este canal
+  FDispatchPool.Free; // nil-safe; se atribuído, já não há mais itens em voo
   FRecovery.Free;
   FRecoveryLock.Free;
   FUnconfirmed.Free;
@@ -1887,6 +2022,14 @@ begin
   end;
 end;
 
+procedure TAMQPChannel.DispatchToPool(const AProc: TProc);
+begin
+  if Assigned(FDispatchPool) then
+    FDispatchPool.Enqueue(AProc)
+  else
+    TTask.Run(AProc);
+end;
+
 procedure TAMQPChannel.DispatchDelivery(const ADeliver: TAMQPBasicDeliver;
   const AProps: TAMQPBasicProperties; const ABody: TBytes);
 var
@@ -1918,9 +2061,9 @@ begin
     Exit;
   end;
 
-  // Despacha para o pool nativo; a thread de leitura NÃO roda o callback.
+  // Despacha para o pool; a thread de leitura NÃO roda o callback.
   TInterlocked.Increment(FInFlight);
-  TTask.Run(
+  DispatchToPool(
     procedure
     begin
       try
@@ -1958,9 +2101,9 @@ begin
     Exit;
   end;
 
-  // Despacha para o pool nativo; a thread de leitura NÃO roda o callback.
+  // Despacha para o pool; a thread de leitura NÃO roda o callback.
   TInterlocked.Increment(FInFlight);
-  TTask.Run(
+  DispatchToPool(
     procedure
     begin
       try
@@ -1980,9 +2123,9 @@ begin
   LCallback := FOnConfirm;
   if not Assigned(LCallback) then
     Exit;
-  // Despacha para o pool nativo; a thread de leitura NÃO roda o callback.
+  // Despacha para o pool; a thread de leitura NÃO roda o callback.
   TInterlocked.Increment(FInFlight);
-  TTask.Run(
+  DispatchToPool(
     procedure
     begin
       try
